@@ -1,0 +1,5 @@
+{
+    "open_ai_api_key": "",
+    "open_ai_model": "gpt-4o-mini",
+    "open_ai_api_base": ""
+}
