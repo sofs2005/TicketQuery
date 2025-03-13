@@ -127,6 +127,11 @@ class TicketQuery(Plugin):
     is_approximate_time = False
     approximate_time = None
     original_query = None
+    
+    # 新增字段，用于保存原始查询结果
+    original_data = []  # 存储原始查询结果
+    total_data = []     # 存储当前筛选结果
+    current_page = 1
 
     def __init__(self):
         super().__init__()
@@ -135,7 +140,6 @@ class TicketQuery(Plugin):
         # 初始化分页相关属性
         self.current_page = 1
         self.page_size = 10  # 每页显示10条
-        self.total_data = []  # 保存完整查询结果
         self.last_query_params = None  # 保存上次查询参数
         # 初始化近似时间属性
         self.is_approximate_time = False
@@ -737,7 +741,7 @@ class TicketQuery(Plugin):
         logger.info(f"收到筛选问题：+{content}")
         
         # 检查是否有查询结果
-        if not self.total_data:
+        if not self.original_data:
             self._send_error("请先进行车次查询", e_context)
             return
             
@@ -766,7 +770,7 @@ class TicketQuery(Plugin):
                 logger.info("使用普通查询筛选流程")
                 filtered_data = self._manual_filter(content)
         
-        # 更新现有数据
+        # 更新现有数据 - 只更新total_data，保留original_data
         if filtered_data is not None:
             if len(filtered_data) > 0:
                 self.total_data = filtered_data
@@ -808,9 +812,9 @@ class TicketQuery(Plugin):
             openai.api_key = OPENAI_API_KEY
             openai.api_base = OPENAI_API_BASE
             
-            # 准备数据，限制数量防止超出API限制
-            max_data_items = min(len(self.total_data), 20)
-            sample_data = self.total_data[:max_data_items]
+            # 准备数据，始终使用原始数据，限制数量防止超出API限制
+            max_data_items = min(len(self.original_data), 20)
+            sample_data = self.original_data[:max_data_items]
             
             # 构建简化的样本数据以适应token限制
             simplified_samples = []
@@ -847,12 +851,13 @@ class TicketQuery(Plugin):
                             } for seat in route.get("second_leg", {}).get("ticket_info", [])[:2]  # 只包含前两种座位类型
                         ]
                     },
-                    "transfer_time": route.get("transfer_time")
+                    "transfer_time": route.get("transfer_time"),
+                    "index": sample_data.index(route)  # 添加索引以便后续查找
                 }
                 simplified_samples.append(simplified)
             
             sample_json = json.dumps(simplified_samples, ensure_ascii=False)
-            logger.info(f"已准备{len(simplified_samples)}/{len(self.total_data)}条中转数据用于AI分析")
+            logger.info(f"已准备{len(simplified_samples)}/{len(self.original_data)}条中转数据用于AI分析")
             
             # 构建提示
             prompt = f"""
@@ -871,6 +876,7 @@ class TicketQuery(Plugin):
             如果涉及总时间，请查看total_runtime字段（以分钟为单位）；
             如果涉及车次号，请查看first_leg和second_leg中的trainumber字段；
             如果涉及座位类型和价格，请查看ticket_info数组。
+            如果涉及中转站，请查看transfer_station字段,只有完全匹配才算符合条件。
             
             仅返回JSON，不要有其他文字。
             """
@@ -931,16 +937,35 @@ class TicketQuery(Plugin):
                 logger.info(f"AI分析: {result_json.get('analysis', '无分析')[:100]}...")
                 logger.info(f"匹配索引: {indices}")
                 
-                # 根据索引筛选
+                # 根据索引筛选 - 使用全部原始数据
                 if indices:
                     # 需要确保索引有效
-                    valid_indices = [i for i in indices if 0 <= i < len(self.total_data)]
-                    filtered = [self.total_data[i] for i in valid_indices]
-                    logger.info(f"筛选结果: 保留{len(filtered)}/{len(self.total_data)}条中转方案")
+                    valid_indices = [i for i in indices if 0 <= i < len(self.original_data)]
+                    filtered = [self.original_data[i] for i in valid_indices]
+                    logger.info(f"筛选结果: 保留{len(filtered)}/{len(self.original_data)}条中转方案")
+                    
+                    # 根据筛选条件确定排序方式
+                    if any(word in question for word in ["最便宜", "价格最低", "便宜", "低价", "最低", "总票价"]):
+                        logger.info("检测到价格相关筛选条件，对结果按价格排序")
+                        filtered.sort(key=lambda x: float(x.get('total_price', float('inf'))))
+                    elif any(word in question for word in ["最快", "时间最短", "耗时最少", "最短", "总时长"]):
+                        logger.info("检测到时间相关筛选条件，对结果按时间排序")
+                        filtered.sort(key=lambda x: int(x.get('total_runtime', float('inf'))))
+                        
+                    # 如果是要求最便宜/最快的一个，只返回第一个结果
+                    if "最" in question and filtered:
+                        if any(word in question for word in ["最便宜", "价格最低", "最低", "总票价最低"]):
+                            logger.info(f"根据'最便宜'条件，只返回价格最低的方案: {filtered[0].get('total_price')}元")
+                            return [filtered[0]]
+                        elif any(word in question for word in ["最快", "时间最短", "耗时最少", "总时长最短"]):
+                            logger.info(f"根据'最快'条件，只返回时间最短的方案: {filtered[0].get('total_runtime')}分钟")
+                            return [filtered[0]]
+                    
                     return filtered
                 else:
-                    logger.warning("AI未找到匹配的中转方案")
-                    return []
+                    # 如果AI无法找到匹配的，回退到手动筛选
+                    logger.warning("AI未找到匹配的中转方案，尝试手动筛选")
+                    return self._manual_filter_transfer(question)
                     
             except Exception as api_error:
                 logger.error(f"API调用或解析失败: {api_error}")
@@ -955,17 +980,46 @@ class TicketQuery(Plugin):
     def _manual_filter_transfer(self, question):
         """针对中转查询结果的手动筛选"""
         logger.info(f"手动筛选中转查询结果: {question}")
-        filtered = []
+        
+        # 始终使用原始数据作为筛选基础
+        data_to_filter = self.original_data
+        logger.info(f"基于{len(data_to_filter)}条原始数据进行筛选")
+        
+        # 筛选逻辑 - 中转站相关
+        if any(station in question for station in MAJOR_STATIONS):
+            logger.info("检测到中转站相关筛选条件")
+            
+            # 提取指定的中转站
+            specified_station = None
+            for station in MAJOR_STATIONS:
+                if station in question:
+                    specified_station = station
+                    logger.info(f"识别到筛选条件中的中转站: {station}")
+                    break
+                    
+            if specified_station:
+                logger.info(f"筛选中转站为{specified_station}的方案")
+                filtered = []
+                for route in data_to_filter:
+                    station = route.get('transfer_station')
+                    logger.info(f"检查路线中转站: {station}")
+                    if station == specified_station:
+                        filtered.append(route)
+                
+                logger.info(f"找到{len(filtered)}个经过{specified_station}的中转方案")
+                return filtered
         
         # 筛选逻辑 - 价格相关
-        if any(word in question for word in ["最便宜", "价格最低", "便宜", "低价", "最低", "总票价"]):
+        elif any(word in question for word in ["最便宜", "价格最低", "便宜", "低价", "最低", "总票价"]):
             logger.info("检测到价格相关筛选条件")
             
             # 按总价排序
-            sorted_routes = sorted(self.total_data, key=lambda x: x.get('total_price', float('inf')))
+            sorted_routes = sorted(data_to_filter, key=lambda x: float(x.get('total_price', float('inf'))))
+            logger.info(f"按总价排序完成，前3个方案的价格: " + 
+                       ", ".join([f"{route.get('total_price', 'N/A')}元" for route in sorted_routes[:3]]))
             
             # 是否只返回最低价
-            if "最" in question:
+            if any(word in question for word in ["最便宜", "价格最低", "最低", "总票价最低"]):
                 if sorted_routes:
                     logger.info(f"找到最便宜的中转方案，总价: {sorted_routes[0].get('total_price')}元")
                     return [sorted_routes[0]]
@@ -980,10 +1034,12 @@ class TicketQuery(Plugin):
             logger.info("检测到时间相关筛选条件")
             
             # 按总时间排序
-            sorted_routes = sorted(self.total_data, key=lambda x: x.get('total_runtime', float('inf')))
+            sorted_routes = sorted(data_to_filter, key=lambda x: int(x.get('total_runtime', float('inf'))))
+            logger.info(f"按总时长排序完成，前3个方案的时长(分钟): " + 
+                       ", ".join([f"{route.get('total_runtime', 'N/A')}" for route in sorted_routes[:3]]))
             
             # 是否只返回最快的
-            if "最" in question:
+            if any(word in question for word in ["最快", "时间最短", "耗时最少", "总时长最短"]):
                 if sorted_routes:
                     total_minutes = sorted_routes[0].get('total_runtime', 0)
                     hours = total_minutes // 60
@@ -996,44 +1052,27 @@ class TicketQuery(Plugin):
                 logger.info(f"按总时长排序，找到{len(sorted_routes)}个方案")
                 return sorted_routes
                 
-        # 筛选逻辑 - 中转站相关
-        elif any(station in question for station in MAJOR_STATIONS):
-            logger.info("检测到中转站相关筛选条件")
-            
-            # 提取指定的中转站
-            specified_station = None
-            for station in MAJOR_STATIONS:
-                if station in question:
-                    specified_station = station
-                    break
-                    
-            if specified_station:
-                logger.info(f"筛选中转站为{specified_station}的方案")
-                filtered = [route for route in self.total_data 
-                           if route.get('transfer_station') == specified_station]
-                return filtered
-                
         # 筛选逻辑 - 换乘时间相关
         elif any(word in question for word in ["换乘时间", "中转时间", "等待时间"]):
             logger.info("检测到换乘时间相关筛选条件")
             
             # 是否要求最短换乘时间
             if any(word in question for word in ["最短", "最少"]):
-                sorted_routes = sorted(self.total_data, key=lambda x: x.get('transfer_time', float('inf')))
+                sorted_routes = sorted(data_to_filter, key=lambda x: int(x.get('transfer_time', float('inf'))))
                 if sorted_routes:
                     logger.info(f"找到换乘时间最短的方案: {sorted_routes[0].get('transfer_time')}分钟")
                     return [sorted_routes[0]]
                 
             # 是否要求最长换乘时间（可能是为了在中转站游玩）
             elif any(word in question for word in ["最长", "最多"]):
-                sorted_routes = sorted(self.total_data, key=lambda x: x.get('transfer_time', 0), reverse=True)
+                sorted_routes = sorted(data_to_filter, key=lambda x: int(x.get('transfer_time', 0)), reverse=True)
                 if sorted_routes:
                     logger.info(f"找到换乘时间最长的方案: {sorted_routes[0].get('transfer_time')}分钟")
                     return [sorted_routes[0]]
         
         # 筛选逻辑 - 车次号相关
         elif "车次" in question or "班次" in question:
-            for route in self.total_data:
+            for route in data_to_filter:
                 first_train = route.get('first_leg', {}).get('trainumber', '')
                 second_train = route.get('second_leg', {}).get('trainumber', '')
                 
@@ -1044,9 +1083,34 @@ class TicketQuery(Plugin):
                 logger.info(f"按车次号筛选，找到{len(filtered)}个匹配方案")
                 return filtered
         
+        # 如果所有条件都不匹配，尝试使用更一般化的关键词匹配
+        if "线路" in question or "方案" in question:
+            if "最低" in question or "最便宜" in question:
+                logger.info("检测到通用价格相关筛选条件")
+                sorted_routes = sorted(data_to_filter, key=lambda x: float(x.get('total_price', float('inf'))))
+                
+                if "最" in question:
+                    if sorted_routes:
+                        logger.info(f"找到最便宜的中转方案，总价: {sorted_routes[0].get('total_price')}元")
+                        return [sorted_routes[0]]
+                    else:
+                        return []
+                else:
+                    return sorted_routes
+            
+            # 处理"中转"或"经过"等关键词
+            elif "中转" in question or "经过" in question:
+                for station in MAJOR_STATIONS:
+                    if station in question:
+                        logger.info(f"检测到通用中转站筛选条件: {station}")
+                        filtered = [route for route in data_to_filter if route.get('transfer_station') == station]
+                        if filtered:
+                            logger.info(f"找到{len(filtered)}个经过{station}的中转方案")
+                            return filtered
+        
         # 默认返回原始数据
         logger.info("未识别到明确的筛选条件，返回原始数据")
-        return self.total_data
+        return data_to_filter
 
     def _handle_transfer_query(self, e_context):
         """处理中转查询请求"""
@@ -1140,6 +1204,7 @@ class TicketQuery(Plugin):
                       f"日期={query_date}, 时间={query_time or '全天'}")
             
             # 清空之前的查询结果
+            self.original_data = []
             self.total_data = []
             self.current_page = 1
             
@@ -1160,9 +1225,10 @@ class TicketQuery(Plugin):
                 self._send_error(f"未找到从{from_loc}经中转站到{to_loc}的可行路线", e_context)
                 return
                 
-            # 保存结果到total_data供后续筛选使用
-            self.total_data = transfer_routes
-            logger.info(f"已保存{len(transfer_routes)}条中转查询结果到total_data")
+            # 保存结果到original_data和total_data
+            self.original_data = transfer_routes
+            self.total_data = transfer_routes.copy()  # 使用副本，避免引用相同对象
+            logger.info(f"已保存{len(transfer_routes)}条中转查询结果")
             
             # 格式化并发送响应
             reply = Reply()
