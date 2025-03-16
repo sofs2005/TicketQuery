@@ -260,242 +260,107 @@ class TicketQuery(Plugin):
             logger.info("开始处理后续筛选问题")
             self._handle_followup_question(e_context)
             return
-
-        # 清理10分钟前的历史记录
-        if self.last_interaction_time and datetime.now() - self.last_interaction_time > timedelta(minutes=10):
-            self.conversation_history.clear()
-            self.total_data = []
-            self.current_page = 1
-            logger.info("已清除过期对话历史")
-
-        self.last_interaction_time = datetime.now()
-
-        # 处理中转查询
-        if self.content.startswith("中转+") or "中转" in self.content or "换乘" in self.content:
+            
+        # 处理帮助命令
+        if self.content == "高铁查询" or self.content == "火车查询" or self.content == "车票查询":
+            help_text = self.get_help_text()
+            reply = Reply()
+            reply.type = ReplyType.TEXT
+            reply.content = help_text
+            e_context["reply"] = reply
+            e_context.action = EventAction.BREAK_PASS
+            return
+            
+        # 检查是否是中转查询
+        if self.content.startswith("中转") or "换乘" in self.content:
             logger.info("检测到中转查询请求")
             self._handle_transfer_query(e_context)
             return
-
-        # 检查是否是自然语言查询
-        if any(keyword in self.content for keyword in ["高铁", "动车", "普通"]) and any(keyword in self.content for keyword in ["到", "去", "至"]):
-            logger.info("检测到自然语言查询，开始处理")
             
-            # 首先尝试使用OpenAI进行处理
-            if USE_OPENAI:
-                logger.info("====== 使用OpenAI处理自然语言查询 ======")
-                logger.info(f"API密钥状态: {'已配置' if OPENAI_API_KEY else '未配置'}")
-                logger.info(f"API基础URL: {OPENAI_API_BASE}")
-                logger.info(f"使用模型: {OPENAI_MODEL}")
-                
-                # 尝试调用OpenAI解析
-                parsed_query = self._ai_parse_query(self.content)
-                if parsed_query:
-                    logger.info(f"OpenAI成功解析查询: {parsed_query}")
-                    self.content = parsed_query
-                    self._handle_main_query(e_context)
-                    return
-                else:
-                    logger.warning("OpenAI解析失败，回退到正则表达式解析")
-            else:
-                logger.warning("OpenAI未配置，使用正则表达式解析")
-                
-            # 如果OpenAI未配置或调用失败，回退到正则表达式解析
-            self._process_natural_language()
-            # 自然语言处理后直接交给主查询处理
-            self._handle_main_query(e_context)
-            return
-
-        # 处理主查询
-        if self.content.split()[0] in ["高铁", "普通", "动车"]:
-            logger.info("开始处理主查询")
-            self._handle_main_query(e_context)
+        # 所有其他查询都视为普通查询，用LLM处理
+        logger.info("处理普通查询请求")
+        # 保存原始查询内容，便于后续处理
+        self.original_query = self.content
+        self._process_query(e_context)
 
     def _process_natural_language(self):
-        """处理自然语言查询"""
+        """处理自然语言查询，完全由LLM解析"""
         try:
-            logger.info(f"开始解析自然语言查询：{self.content}")
+            logger.info(f"开始使用LLM解析自然语言查询：{self.content}")
             
-            # 1. 提取车型
-            ticket_type = "高铁" if "高铁" in self.content else "动车" if "动车" in self.content else "普通"
+            # 直接调用LLM解析函数
+            parsed_result = self._ai_parse_query(self.content)
             
-            # 2. 提取城市 - 支持多种表达方式
-            # 匹配模式1：从A到B
-            location_pattern1 = r"从([\u4e00-\u9fa5]+)到([\u4e00-\u9fa5]+)"
-            # 匹配模式2：A到B / A至B / A去B
-            location_pattern2 = r"([\u4e00-\u9fa5]+)(?:到|至|去)([\u4e00-\u9fa5]+)"
-            
-            # 先处理日期和时间短语
-            time_keywords = ["今天", "明天", "后天", "下午", "上午", "晚上", "凌晨", "中午", "早上"]
-            cleaned_content = self.content
-            for keyword in time_keywords:
-                cleaned_content = cleaned_content.replace(keyword, " " + keyword + " ")
-            
-            logger.info(f"预处理后的查询内容：{cleaned_content}")
-            
-            # 在预处理后的内容中查找城市
-            location_match = re.search(location_pattern1, cleaned_content)
-            if not location_match:
-                location_match = re.search(location_pattern2, cleaned_content)
-                
-            if not location_match:
-                logger.warning("未找到出发地和目的地")
+            if not parsed_result:
+                logger.warning("LLM解析失败，无法处理查询")
                 return
                 
-            from_city = location_match.group(1).strip()
-            to_city = location_match.group(2).strip()
-            
-            # 清除可能的额外文本和时间词
-            for keyword in time_keywords:
-                from_city = from_city.replace(keyword, "").strip()
-                to_city = to_city.replace(keyword, "").strip()
-                
-            # 清除可能的额外文本
-            to_city = to_city.split("的")[0].strip() if "的" in to_city else to_city
-            
-            logger.info(f"识别到城市：{from_city} -> {to_city}")
-            
-            # 3. 处理时间
-            now = datetime.now()
-            query_date = now.strftime("%Y-%m-%d")  # 默认今天
-            query_time = None
-            
-            # 处理日期
-            if "明天" in self.content:
-                query_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-                logger.info(f"识别到日期：明天 ({query_date})")
-            elif "后天" in self.content:
-                query_date = (now + timedelta(days=2)).strftime("%Y-%m-%d")
-                logger.info(f"识别到日期：后天 ({query_date})")
-            else:
-                logger.info(f"使用默认日期：今天 ({query_date})")
-                
-            # 处理具体时间
-            time_pattern = r"(\d{1,2})(?:点|时|:|：)(\d{0,2})(?:分|)|(\d{1,2})(?:点|时)"
-            time_match = re.search(time_pattern, self.content)
-            
-            if time_match:
-                if time_match.group(3):  # 匹配了"3点"这种格式
-                    hour = int(time_match.group(3))
-                    minute = 0
-                else:  # 匹配了"3:30"或"3点30分"这种格式
-                    hour = int(time_match.group(1))
-                    minute = int(time_match.group(2)) if time_match.group(2) else 0
-                
-                # 处理12小时制转24小时制
-                if "下午" in self.content or "晚上" in self.content:
-                    if hour < 12:
-                        hour += 12
-                        
-                query_time = f"{hour:02d}:{minute:02d}"
-                logger.info(f"提取到具体时间：{query_time}")
-                
-                # 处理"左右"、"前后"等模糊表达，设置时间窗口
-                if any(word in self.content for word in ["左右", "前后", "附近"]):
-                    # 这里我们不改变query_time，但记录这是一个近似时间
-                    # 后续处理中会使用一个时间窗口，比如±30分钟
-                    self.is_approximate_time = True
-                    self.approximate_time = query_time
-                    logger.info(f"检测到模糊时间表达，将使用{query_time}±30分钟的时间窗口")
-            
-            # 如果没有提取到具体时间，则尝试提取时间段
-            if not query_time:
-                if "上午" in self.content:
-                    query_time = "09:00"
-                    logger.info("识别到时间段：上午，设置为09:00")
-                elif "下午" in self.content and "晚" not in self.content:
-                    query_time = "14:00"
-                    logger.info("识别到时间段：下午，设置为14:00")
-                elif "晚上" in self.content or "傍晚" in self.content:
-                    query_time = "19:00"
-                    logger.info("识别到时间段：晚上，设置为19:00")
-            
-            # 4. 构建查询参数
-            parts = [ticket_type, from_city, to_city]
-            if query_date:
-                parts.append(query_date)
-            if query_time:
-                parts.append(query_time)
-                
-            self.content = " ".join(parts)
-            logger.info(f"解析结果：{self.content}")
-            
-            # 5. 记录原始查询，用于后续精确过滤
+            # 保存原始查询，用于后续精确过滤
             self.original_query = self.content
-            if "左右" in self.content or "前后" in self.content or "附近" in self.content:
-                self.is_approximate_time = True
-                self.approximate_time = query_time
-            else:
-                self.is_approximate_time = False
+            
+            # 检查是否包含模糊时间表达
+            fuzzy_time_words = ["左右", "前后", "附近"]
+            if any(word in self.content for word in fuzzy_time_words):
+                # 获取解析结果中的时间部分（如果有）
+                parts = parsed_result.split()
+                if len(parts) >= 5:  # 包含时间
+                    self.is_approximate_time = True
+                    self.approximate_time = parts[4]
+                    logger.info(f"检测到模糊时间表达，将使用{self.approximate_time}±30分钟的时间窗口")
+            
+            # 使用解析结果作为查询内容
+            self.content = parsed_result
+            logger.info(f"LLM解析结果：{self.content}")
                 
         except Exception as e:
-            logger.error(f"自然语言解析失败：{e}")
+            logger.error(f"LLM自然语言解析失败：{e}")
             logger.error(traceback.format_exc())
 
     def _handle_main_query(self, e_context):
         """处理主查询请求"""
-        logger.info(f"处理主查询：{self.content}")
-        parts = self.content.split()
+        logger.info(f"处理主查询: {self.content}")
         
-        # 检查参数数量
-        if len(parts) < 3:
-            self._send_error("参数不足，请至少提供车型、出发地和目的地", e_context)
-            return
-
         try:
-            # 解析基础参数
+            parts = self.content.split()
+            
+            # 确保有足够的查询参数
+            if len(parts) < 3:
+                self._send_error("查询参数不足，请至少提供车型、出发地和目的地", e_context)
+                return
+            
+            # 获取查询参数
             ticket_type = parts[0]
-            from_location = parts[1]
-            to_location = parts[2]
+            from_loc = parts[1]
+            to_loc = parts[2]
+            date = parts[3] if len(parts) >= 4 else datetime.now().strftime("%Y-%m-%d")
+            time = parts[4] if len(parts) >= 5 else ""
             
-            # 获取当前时间
-            now = datetime.now()
-            query_date = now.strftime("%Y-%m-%d")
-            query_time = None
+            logger.info(f"解析的查询参数: 车型={ticket_type}, 出发地={from_loc}, 目的地={to_loc}, 日期={date}, 时间={time}")
             
-            # 处理可选参数
-            if len(parts) >= 4:
-                if re.match(r"\d{4}-\d{2}-\d{2}", parts[3]):
-                    query_date = parts[3]
-                elif re.match(r"\d{1,2}:\d{2}", parts[3]):
-                    query_time = parts[3]
-                    
-            if len(parts) >= 5:
-                if re.match(r"\d{1,2}:\d{2}", parts[4]):
-                    query_time = parts[4]
-
-            # 记录查询参数
-            logger.info(f"查询参数：车型={ticket_type}, 出发={from_location}, 到达={to_location}, "
-                       f"日期={query_date}, 时间={query_time or '全天'}")
-
-            # 获取票务信息
-            result = self.get_ticket_info(
-                ticket_type, 
-                from_location, 
-                to_location,
-                query_date,
-                query_time
-            )
+            # 调用车票API获取信息
+            trains = self.get_ticket_info(ticket_type, from_loc, to_loc, date, time)
             
-            if result:
-                # 保存完整数据用于分页
-                self.total_data = result
-                self.last_query_params = (ticket_type, from_location, to_location, query_date, query_time)
-                self.current_page = 1
+            if not trains:
+                self._send_error(f"未能找到从{from_loc}到{to_loc}的{ticket_type}车次", e_context)
+                return
                 
-                # 显示第一页结果
-                reply = Reply()
-                reply.type = ReplyType.TEXT
-                reply.content = self._format_response(self._get_current_page())
-            else:
-                reply = Reply()
-                reply.type = ReplyType.ERROR
-                reply.content = "未找到符合条件的车次"
-                
+            # 保存查询结果，便于后续筛选
+            self.original_data = trains
+            self.total_data = trains
+            self.current_page = 1
+            
+            # 格式化并返回结果
+            page_data = self._get_current_page()
+            reply_content = self._format_response(page_data)
+            
+            reply = Reply()
+            reply.type = ReplyType.TEXT
+            reply.content = reply_content
             e_context["reply"] = reply
             e_context.action = EventAction.BREAK_PASS
-
+            
         except Exception as e:
-            logger.error(f"处理查询时发生错误：{e}")
+            logger.error(f"处理主查询时出错: {e}")
             logger.error(traceback.format_exc())
             self._send_error("查询处理失败，请稍后重试", e_context)
 
@@ -576,9 +441,41 @@ class TicketQuery(Plugin):
         logger.info(f"开始处理API数据：车型={ticket_type}, 查询时间={query_time}")
         logger.info(f"收到{len(data)}条数据待处理")
         
+        # 处理模糊时间表达
+        time_window_minutes = 30  # 默认时间窗口±30分钟
+        time_range_start = None
+        time_range_end = None
+        
+        # 处理自然语言时间表达
+        if query_time in ["上午", "早上", "早晨", "凌晨"]:
+            logger.info(f"检测到自然语言时间表达：{query_time}，转换为时间范围")
+            time_range_start = "06:00"  # 早上6点
+            time_range_end = "12:00"    # 中午12点
+        elif query_time in ["中午"]:
+            logger.info(f"检测到自然语言时间表达：{query_time}，转换为时间范围")
+            time_range_start = "11:00"  # 上午11点
+            time_range_end = "13:00"    # 下午1点
+        elif query_time in ["下午"]:
+            logger.info(f"检测到自然语言时间表达：{query_time}，转换为时间范围")
+            time_range_start = "12:00"  # 中午12点
+            time_range_end = "18:00"    # 下午6点
+        elif query_time in ["傍晚"]:
+            logger.info(f"检测到自然语言时间表达：{query_time}，转换为时间范围")
+            time_range_start = "17:00"  # 下午5点
+            time_range_end = "19:00"    # 晚上7点
+        elif query_time in ["晚上", "夜晚", "夜里"]:
+            logger.info(f"检测到自然语言时间表达：{query_time}，转换为时间范围")
+            time_range_start = "18:00"  # 下午6点
+            time_range_end = "23:59"    # 午夜
+            
         # 记录时间过滤状态
-        if self.is_approximate_time:
-            logger.info(f"启用近似时间过滤：{self.approximate_time}±30分钟")
+        if time_range_start and time_range_end:
+            logger.info(f"使用时间范围筛选：{time_range_start}至{time_range_end}")
+            # 覆盖原有的近似时间设置
+            self.is_approximate_time = False
+            self.approximate_time = None
+        elif self.is_approximate_time:
+            logger.info(f"启用近似时间过滤：{self.approximate_time}±{time_window_minutes}分钟")
         elif query_time:
             logger.info(f"启用精确时间过滤：{query_time}之后的车次")
         else:
@@ -600,46 +497,66 @@ class TicketQuery(Plugin):
                     continue
                     
                 # 2. 时间筛选
-                # 如果是近似时间查询（例如"10点左右"），使用时间窗口
-                if self.is_approximate_time and self.approximate_time:
-                    try:
-                        # 解析近似时间和发车时间
-                        approx_time_obj = datetime.strptime(self.approximate_time, "%H:%M").time()
-                        depart_time_obj = datetime.strptime(depart_time, "%H:%M").time()
+                try:
+                    # 解析发车时间
+                    depart_time_obj = datetime.strptime(depart_time, "%H:%M").time()
+                    depart_minutes = depart_time_obj.hour * 60 + depart_time_obj.minute
+                    
+                    # 处理时间范围筛选（如"上午"、"下午"等）
+                    if time_range_start and time_range_end:
+                        start_time_obj = datetime.strptime(time_range_start, "%H:%M").time()
+                        end_time_obj = datetime.strptime(time_range_end, "%H:%M").time()
                         
-                        # 计算时间差（分钟）
-                        approx_minutes = approx_time_obj.hour * 60 + approx_time_obj.minute
-                        depart_minutes = depart_time_obj.hour * 60 + depart_time_obj.minute
-                        time_diff = abs(approx_minutes - depart_minutes)
+                        start_minutes = start_time_obj.hour * 60 + start_time_obj.minute
+                        end_minutes = end_time_obj.hour * 60 + end_time_obj.minute
                         
-                        # 使用30分钟的时间窗口
-                        if time_diff > 30:
-                            logger.info(f"车次{train_number}发车时间{depart_time}与近似时间{self.approximate_time}相差{time_diff}分钟，超出30分钟窗口，跳过")
+                        # 检查发车时间是否在范围内
+                        if not (start_minutes <= depart_minutes <= end_minutes):
+                            logger.info(f"车次{train_number}发车时间{depart_time}不在指定范围{time_range_start}-{time_range_end}内，跳过")
                             continue
                         else:
-                            logger.info(f"✓ 车次{train_number}发车时间{depart_time}在近似时间{self.approximate_time}的30分钟窗口内")
-                    except ValueError as e:
-                        logger.warning(f"近似时间格式解析错误: {e}")
-                        
-                # 常规时间筛选
-                elif query_time:
-                    try:
-                        query_time_obj = datetime.strptime(query_time, "%H:%M").time()
-                        depart_time_obj = datetime.strptime(depart_time, "%H:%M").time()
-                        
-                        # 计算时间差（分钟）
-                        query_minutes = query_time_obj.hour * 60 + query_time_obj.minute
-                        depart_minutes = depart_time_obj.hour * 60 + depart_time_obj.minute
-                        time_diff = depart_minutes - query_minutes
-                        
-                        if time_diff < -30:  # 发车时间早于查询时间30分钟以上
-                            logger.info(f"车次{train_number}发车时间{depart_time}早于查询时间{query_time}超过30分钟，跳过")
-                            continue
-                        else:
-                            logger.info(f"✓ 车次{train_number}发车时间{depart_time}接近或晚于查询时间{query_time}")
-                    except ValueError as e:
-                        logger.warning(f"时间格式解析错误: {e}")
-                        continue
+                            logger.info(f"✓ 车次{train_number}发车时间{depart_time}在指定范围{time_range_start}-{time_range_end}内")
+                            
+                    # 处理近似时间筛选（如"10:30左右"）
+                    elif self.is_approximate_time and self.approximate_time:
+                        try:
+                            # 解析近似时间
+                            approx_time_obj = datetime.strptime(self.approximate_time, "%H:%M").time()
+                            approx_minutes = approx_time_obj.hour * 60 + approx_time_obj.minute
+                            
+                            # 计算时间差（分钟）
+                            time_diff = abs(approx_minutes - depart_minutes)
+                            
+                            # 使用指定的时间窗口
+                            if time_diff > time_window_minutes:
+                                logger.info(f"车次{train_number}发车时间{depart_time}与近似时间{self.approximate_time}相差{time_diff}分钟，超出{time_window_minutes}分钟窗口，跳过")
+                                continue
+                            else:
+                                logger.info(f"✓ 车次{train_number}发车时间{depart_time}在近似时间{self.approximate_time}的{time_window_minutes}分钟窗口内")
+                        except ValueError as e:
+                            logger.warning(f"近似时间格式解析错误: {e}")
+                            # 格式错误时，不进行筛选，允许通过
+                    
+                    # 常规时间筛选（如"14:00"）
+                    elif query_time and ":" in query_time:
+                        try:
+                            query_time_obj = datetime.strptime(query_time, "%H:%M").time()
+                            query_minutes = query_time_obj.hour * 60 + query_time_obj.minute
+                            
+                            # 计算时间差（分钟）
+                            time_diff = depart_minutes - query_minutes
+                            
+                            if time_diff < -30:  # 发车时间早于查询时间30分钟以上
+                                logger.info(f"车次{train_number}发车时间{depart_time}早于查询时间{query_time}超过30分钟，跳过")
+                                continue
+                            else:
+                                logger.info(f"✓ 车次{train_number}发车时间{depart_time}接近或晚于查询时间{query_time}")
+                        except ValueError as e:
+                            logger.warning(f"时间格式解析错误: {e}")
+                            # 格式错误时，不进行筛选，允许通过
+                except ValueError as e:
+                    logger.warning(f"发车时间格式解析错误: {e}")
+                    # 格式错误时，不进行筛选，允许通过
                         
                 # 3. 添加有效数据
                 filtered.append(item)
@@ -745,30 +662,24 @@ class TicketQuery(Plugin):
             self._send_error("请先进行车次查询", e_context)
             return
             
-        # 判断是否需要使用OpenAI进行智能筛选
-        if USE_OPENAI:
-            logger.info("====== 使用OpenAI进行智能筛选 ======")
-            logger.info(f"API密钥前8位: {OPENAI_API_KEY[:8] if OPENAI_API_KEY else '未配置'}")
-            logger.info(f"API基础URL: {OPENAI_API_BASE}")
-            logger.info(f"使用模型: {OPENAI_MODEL}")
+        # 全部使用LLM进行筛选
+        logger.info("====== 使用LLM进行智能筛选 ======")
+        if not USE_OPENAI or not OPENAI_API_KEY:
+            logger.warning("OpenAI未配置，无法使用AI筛选")
+            self._send_error("无法处理筛选请求，请联系管理员配置LLM服务", e_context)
+            return
             
-            # 判断是否正在处理中转查询结果
-            if hasattr(self, 'is_transfer_query') and self.is_transfer_query:
-                logger.info("检测到正在处理中转查询结果，使用中转筛选流程")
-                filtered_data = self._ai_filter_transfer(content)
-            else:
-                logger.info("使用普通查询筛选流程")
-                filtered_data = self._ai_filter(content)
+        logger.info(f"API密钥前8位: {OPENAI_API_KEY[:8] if OPENAI_API_KEY else '未配置'}")
+        logger.info(f"API基础URL: {OPENAI_API_BASE}")
+        logger.info(f"使用模型: {OPENAI_MODEL}")
+        
+        # 判断是否正在处理中转查询结果
+        if hasattr(self, 'is_transfer_query') and self.is_transfer_query:
+            logger.info("检测到正在处理中转查询结果，使用中转筛选流程")
+            filtered_data = self._ai_filter_transfer(content)
         else:
-            logger.info("OpenAI未配置，使用本地筛选逻辑")
-            
-            # 判断是否正在处理中转查询结果
-            if hasattr(self, 'is_transfer_query') and self.is_transfer_query:
-                logger.info("检测到正在处理中转查询结果，使用中转筛选流程")
-                filtered_data = self._manual_filter_transfer(content)
-            else:
-                logger.info("使用普通查询筛选流程")
-                filtered_data = self._manual_filter(content)
+            logger.info("使用普通查询筛选流程")
+            filtered_data = self._ai_filter(content)
         
         # 更新现有数据 - 只更新total_data，保留original_data
         if filtered_data is not None:
@@ -1114,133 +1025,109 @@ class TicketQuery(Plugin):
 
     def _handle_transfer_query(self, e_context):
         """处理中转查询请求"""
-        logger.info(f"开始处理中转查询: {self.content}")
+        query = self.content.strip()
+        logger.info(f"处理中转查询: {query}")
         
-        # 设置查询类型标记，以便后续筛选区分处理
-        self.original_query = self.content
-        self.is_transfer_query = True  # 标记为中转查询
-        
-        try:
-            # 解析查询参数
-            content = self.content
+        # 去掉"中转"前缀
+        if query.startswith("中转"):
+            query = query[2:].strip()
             
-            # 解析自然语言中转查询
-            is_natural_language = False
-            if not content.startswith("中转+") and ("中转" in content or "换乘" in content):
-                is_natural_language = True
-                logger.info("检测到自然语言中转查询，开始解析")
+        # 优先使用LLM解析中转查询
+        if USE_OPENAI and OPENAI_API_KEY:
+            logger.info("使用LLM解析中转查询")
+            parsed_result = self._ai_parse_transfer_query(query)
+            
+            if parsed_result:
+                logger.info(f"LLM解析中转查询成功: {parsed_result}")
                 
-                # 首先尝试使用OpenAI进行解析
-                if USE_OPENAI and OPENAI_API_KEY:
-                    logger.info("====== 尝试使用OpenAI解析中转查询 ======")
-                    logger.info(f"API密钥状态: {'已配置' if OPENAI_API_KEY else '未配置'}")
-                    logger.info(f"API基础URL: {OPENAI_API_BASE}")
-                    logger.info(f"使用模型: {OPENAI_MODEL}")
+                # 解析结果格式: 车型 出发城市 目的城市 日期 [时间]
+                parts = parsed_result.split()
+                
+                if len(parts) >= 3:  # 至少需要车型、出发城市和目的城市
+                    ticket_type = parts[0]
+                    from_loc = parts[1]
+                    to_loc = parts[2]
+                    date = parts[3] if len(parts) >= 4 else datetime.now().strftime("%Y-%m-%d")
+                    time = parts[4] if len(parts) >= 5 else None
                     
-                    # 调用OpenAI解析
-                    ai_result = self._ai_parse_transfer_query(content)
-                    if ai_result:
-                        logger.info("OpenAI成功解析中转查询")
-                        ticket_type, from_loc, to_loc, query_date, query_time, user_specified_transfer = ai_result
-                    else:
-                        logger.warning("OpenAI解析失败，回退到正则表达式解析")
-                        ticket_type, from_loc, to_loc, query_date, query_time, user_specified_transfer = self._parse_natural_transfer_query(content)
-                else:
-                    logger.info("OpenAI未配置或禁用，使用正则表达式解析")
-                    ticket_type, from_loc, to_loc, query_date, query_time, user_specified_transfer = self._parse_natural_transfer_query(content)
-                
-                if ticket_type and from_loc and to_loc:
-                    logger.info(f"自然语言解析结果: 车型={ticket_type}, 出发={from_loc}, 目的地={to_loc}, "
-                              f"日期={query_date}, 时间={query_time or '全天'}, 指定中转站={user_specified_transfer or '无'}")
-                else:
-                    self._send_error("无法解析中转查询，请使用格式: 中转+高铁 上海 成都 2024-03-15", e_context)
+                    logger.info(f"解析结果: 车型={ticket_type}, 出发地={from_loc}, 目的地={to_loc}, 日期={date}, 时间={time}")
+                    
+                    # 查找可能的中转站
+                    user_specified = None # 用户是否在查询中指定了中转站
+                    transfer_stations = self._find_transfer_stations(from_loc, to_loc, user_specified)
+                    
+                    if not transfer_stations:
+                        self._send_error(f"无法找到从{from_loc}到{to_loc}的合适中转站", e_context)
+                        return
+                    
+                    # 搜索所有中转路线
+                    transfer_routes = self._search_transfer_routes(ticket_type, from_loc, to_loc, transfer_stations, date, time)
+                    
+                    if not transfer_routes:
+                        self._send_error(f"未找到从{from_loc}到{to_loc}的中转路线", e_context)
+                        return
+                    
+                    # 保存查询结果
+                    self.original_data = transfer_routes
+                    self.total_data = transfer_routes
+                    self.is_transfer_query = True
+                    self.current_page = 1
+                    
+                    # 格式化响应
+                    page_data = transfer_routes[:20]  # 限制显示条数
+                    reply_content = self._format_transfer_response(page_data)
+                    
+                    reply = Reply()
+                    reply.type = ReplyType.TEXT
+                    reply.content = reply_content
+                    e_context["reply"] = reply
+                    e_context.action = EventAction.BREAK_PASS
                     return
+                else:
+                    logger.warning(f"LLM解析结果不完整: {parsed_result}")
             else:
-                # 标准格式解析
-                logger.info("使用标准格式解析中转查询")
-                
-                # 如果查询以"中转+"开头，去掉这个前缀
-                if content.startswith("中转+"):
-                    content = content[3:]
-                
-                # 检查用户是否指定了中转站
-                user_specified_transfer = None
-                for station in MAJOR_STATIONS:
-                    if f"经{station}" in content or f"通过{station}" in content or f"从{station}中转" in content:
-                        user_specified_transfer = station
-                        logger.info(f"用户指定中转站: {station}")
-                        content = content.replace(f"经{station}", "").replace(f"通过{station}", "").replace(f"从{station}中转", "")
-                        break
-                
-                # 按照标准格式解析查询参数
-                parts = content.strip().split()
-                
-                if len(parts) < 3:
-                    self._send_error("中转查询参数不足，请至少提供车型、出发地和目的地", e_context)
-                    return
-                    
-                # 解析参数
-                ticket_type = parts[0]
-                from_loc = parts[1]
-                to_loc = parts[2]
-                
-                # 获取当前时间作为默认值
-                now = datetime.now()
-                query_date = now.strftime("%Y-%m-%d")
-                query_time = None
-                
-                # 处理可选参数
-                if len(parts) >= 4:
-                    if re.match(r"\d{4}-\d{2}-\d{2}", parts[3]):
-                        query_date = parts[3]
-                    elif re.match(r"\d{1,2}:\d{2}", parts[3]):
-                        query_time = parts[3]
-                        
-                if len(parts) >= 5:
-                    if re.match(r"\d{1,2}:\d{2}", parts[4]):
-                        query_time = parts[4]
+                logger.warning("LLM解析中转查询失败")
+        
+        # 如果LLM解析失败或不可用，尝试使用传统解析方法
+        logger.info("尝试使用传统方法解析中转查询")
+        result = self._parse_natural_transfer_query(query)
+        
+        if not result:
+            self._send_error("无法理解查询，请使用正确格式：中转+车型 出发城市 目的城市 日期 [时间]", e_context)
+            return
             
-            logger.info(f"中转查询参数: 车型={ticket_type}, 出发={from_loc}, 目的地={to_loc}, "
-                      f"日期={query_date}, 时间={query_time or '全天'}")
-            
-            # 清空之前的查询结果
-            self.original_data = []
-            self.total_data = []
-            self.current_page = 1
-            
-            # 确定中转站
-            transfer_stations = self._find_transfer_stations(from_loc, to_loc, user_specified_transfer)
-            if not transfer_stations:
-                self._send_error(f"无法找到从{from_loc}到{to_loc}的合适中转站", e_context)
-                return
-                
-            logger.info(f"将尝试以下中转站: {', '.join(transfer_stations)}")
-            
-            # 查询中转路线
-            transfer_routes = self._search_transfer_routes(
-                ticket_type, from_loc, to_loc, transfer_stations, query_date, query_time
-            )
-            
-            if not transfer_routes:
-                self._send_error(f"未找到从{from_loc}经中转站到{to_loc}的可行路线", e_context)
-                return
-                
-            # 保存结果到original_data和total_data
-            self.original_data = transfer_routes
-            self.total_data = transfer_routes.copy()  # 使用副本，避免引用相同对象
-            logger.info(f"已保存{len(transfer_routes)}条中转查询结果")
-            
-            # 格式化并发送响应
-            reply = Reply()
-            reply.type = ReplyType.TEXT
-            reply.content = self._format_transfer_response(transfer_routes)
-            e_context["reply"] = reply
-            e_context.action = EventAction.BREAK_PASS
-            
-        except Exception as e:
-            logger.error(f"处理中转查询时出错: {e}")
-            logger.error(traceback.format_exc())
-            self._send_error("中转查询处理失败，请稍后重试", e_context)
+        ticket_type, from_loc, to_loc, date, time = result
+        logger.info(f"解析结果: 车型={ticket_type}, 出发地={from_loc}, 目的地={to_loc}, 日期={date}, 时间={time}")
+        
+        # 处理剩余的逻辑与之前相同
+        user_specified = None
+        transfer_stations = self._find_transfer_stations(from_loc, to_loc, user_specified)
+        
+        if not transfer_stations:
+            self._send_error(f"无法找到从{from_loc}到{to_loc}的合适中转站", e_context)
+            return
+        
+        transfer_routes = self._search_transfer_routes(ticket_type, from_loc, to_loc, transfer_stations, date, time)
+        
+        if not transfer_routes:
+            self._send_error(f"未找到从{from_loc}到{to_loc}的中转路线", e_context)
+            return
+        
+        # 保存查询结果
+        self.original_data = transfer_routes
+        self.total_data = transfer_routes
+        self.is_transfer_query = True
+        self.current_page = 1
+        
+        # 格式化响应
+        page_data = transfer_routes[:20]  # 限制显示条数
+        reply_content = self._format_transfer_response(page_data)
+        
+        reply = Reply()
+        reply.type = ReplyType.TEXT
+        reply.content = reply_content
+        e_context["reply"] = reply
+        e_context.action = EventAction.BREAK_PASS
 
     def _ai_parse_query(self, query):
         """使用OpenAI解析自然语言查询"""
@@ -1445,7 +1332,7 @@ class TicketQuery(Plugin):
                 
             logger.info(f"OpenAI返回: {result_text}")
             
-            # 验证结果格式
+            # 解析结果
             parts = result_text.split()
             if len(parts) < 3:
                 logger.warning(f"OpenAI返回格式不正确: {result_text}")
@@ -1454,7 +1341,7 @@ class TicketQuery(Plugin):
             # 确保至少包含车型、出发城市和目的城市
             logger.info(f"解析结果: 车型={parts[0]}, 出发城市={parts[1]}, 目的城市={parts[2]}")
             
-            # 如果有日期部分，确保日期是正确的格式
+            # 标准化日期
             if len(parts) >= 4:
                 date_part = parts[3]
                 # 检查日期格式是否正确，如果不正确，尝试解析相对日期表达
@@ -1498,7 +1385,32 @@ class TicketQuery(Plugin):
                         parts[3] = today_date  # 默认使用今天
                     logger.info(f"修正日期为: {parts[3]}")
             
-            # 返回修正后的格式化结果
+            # 标准化时间
+            if len(parts) >= 5:
+                time_part = parts[4]
+                # 检查是否是标准时间格式
+                if not re.match(r"\d{1,2}:\d{2}", time_part):
+                    # 处理自然语言时间表达
+                    if time_part in ["上午", "下午", "晚上", "早上", "中午", "傍晚", "凌晨", "夜晚", "夜里"]:
+                        logger.info(f"保留自然语言时间表达: {time_part}")
+                        # 不做转换，保留原始表达，让_process_api_data方法处理
+                        pass
+                    else:
+                        # 尝试将模糊时间转换为特定时间点
+                        if "早" in time_part or "上午" in time_part:
+                            parts[4] = "09:00"
+                            logger.info(f"将模糊时间'{time_part}'转换为: 09:00")
+                        elif "中午" in time_part:
+                            parts[4] = "12:00"
+                            logger.info(f"将模糊时间'{time_part}'转换为: 12:00")
+                        elif "下午" in time_part:
+                            parts[4] = "14:00"
+                            logger.info(f"将模糊时间'{time_part}'转换为: 14:00")
+                        elif "晚" in time_part or "夜" in time_part:
+                            parts[4] = "19:00"
+                            logger.info(f"将模糊时间'{time_part}'转换为: 19:00")
+            
+            # 重新组合处理后的结果
             return " ".join(parts)
                 
         except Exception as e:
@@ -1630,21 +1542,16 @@ class TicketQuery(Plugin):
 
     def _parse_natural_transfer_query(self, query):
         """解析自然语言中转查询"""
-        logger.info(f"解析自然语言中转查询: {query}")
-        
-        # 默认值
-        ticket_type = "高铁"  # 默认高铁
-        from_loc = None
-        to_loc = None
-        query_date = None
-        query_time = None
-        user_specified_transfer = None
-        
         try:
+            logger.info(f"解析自然语言中转查询: {query}")
+            
             # 1. 提取车型
-            if "动车" in query:
+            ticket_type = "高铁"  # 默认高铁
+            if "高铁" in query:
+                ticket_type = "高铁"
+            elif "动车" in query:
                 ticket_type = "动车"
-            elif "普通" in query:
+            elif "火车" in query:
                 ticket_type = "普通"
             
             # 2. 提取城市 - 支持多种表达方式
@@ -1653,56 +1560,48 @@ class TicketQuery(Plugin):
             # 匹配模式2：A到B / A至B / A去B
             location_pattern2 = r"([\u4e00-\u9fa5]+)(?:到|至|去)([\u4e00-\u9fa5]+)"
             
-            # 先处理日期和时间短语
+            # 预处理内容
             time_keywords = ["今天", "明天", "后天", "下午", "上午", "晚上", "凌晨", "中午", "早上"]
             cleaned_content = query
             for keyword in time_keywords:
                 cleaned_content = cleaned_content.replace(keyword, " " + keyword + " ")
-            
-            logger.info(f"预处理后的查询内容：{cleaned_content}")
-            
-            # 在预处理后的内容中查找城市
+                
+            # 查找城市
             location_match = re.search(location_pattern1, cleaned_content)
             if not location_match:
                 location_match = re.search(location_pattern2, cleaned_content)
                 
             if not location_match:
-                logger.warning("未找到出发地和目的地")
-                return None, None, None, None, None, None
+                logger.warning("自然语言解析: 未找到出发地和目的地")
+                return None
                 
-            from_loc = location_match.group(1).strip()
-            to_loc = location_match.group(2).strip()
+            from_city = location_match.group(1).strip()
+            to_city = location_match.group(2).strip()
             
             # 清除可能的额外文本和时间词
             for keyword in time_keywords:
-                from_loc = from_loc.replace(keyword, "").strip()
-                to_loc = to_loc.replace(keyword, "").strip()
+                from_city = from_city.replace(keyword, "").strip()
+                to_city = to_city.replace(keyword, "").strip()
                 
             # 清除可能的额外文本
-            to_loc = to_loc.split("的")[0].strip() if "的" in to_loc else to_loc
+            to_city = to_city.split("的")[0].strip() if "的" in to_city else to_city
             
-            logger.info(f"识别到城市：{from_loc} -> {to_loc}")
+            logger.info(f"识别到城市: {from_city} -> {to_city}")
             
-            # 3. 提取中转站
-            for station in MAJOR_STATIONS:
-                if f"经{station}" in query or f"通过{station}" in query or f"从{station}中转" in query or f"在{station}中转" in query:
-                    user_specified_transfer = station
-                    logger.info(f"识别到用户指定中转站: {station}")
-                    break
-            
-            # 4. 处理时间
+            # 3. 处理时间
             now = datetime.now()
             query_date = now.strftime("%Y-%m-%d")  # 默认今天
+            query_time = None
             
             # 处理日期
             if "明天" in query:
                 query_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
-                logger.info(f"识别到日期：明天 ({query_date})")
+                logger.info(f"识别到日期: 明天 ({query_date})")
             elif "后天" in query:
                 query_date = (now + timedelta(days=2)).strftime("%Y-%m-%d")
-                logger.info(f"识别到日期：后天 ({query_date})")
+                logger.info(f"识别到日期: 后天 ({query_date})")
             else:
-                logger.info(f"使用默认日期：今天 ({query_date})")
+                logger.info(f"使用默认日期: 今天 ({query_date})")
                 
             # 处理具体时间
             time_pattern = r"(\d{1,2})(?:点|时|:|：)(\d{0,2})(?:分|)|(\d{1,2})(?:点|时)"
@@ -1722,26 +1621,30 @@ class TicketQuery(Plugin):
                         hour += 12
                         
                 query_time = f"{hour:02d}:{minute:02d}"
-                logger.info(f"提取到具体时间：{query_time}")
+                logger.info(f"提取到具体时间: {query_time}")
             
             # 如果没有提取到具体时间，则尝试提取时间段
             if not query_time:
                 if "上午" in query:
                     query_time = "09:00"
-                    logger.info("识别到时间段：上午，设置为09:00")
+                    logger.info("识别到时间段: 上午，设置为09:00")
                 elif "下午" in query and "晚" not in query:
                     query_time = "14:00"
-                    logger.info("识别到时间段：下午，设置为14:00")
+                    logger.info("识别到时间段: 下午，设置为14:00")
                 elif "晚上" in query or "傍晚" in query:
                     query_time = "19:00"
-                    logger.info("识别到时间段：晚上，设置为19:00")
+                    logger.info("识别到时间段: 晚上，设置为19:00")
             
-            return ticket_type, from_loc, to_loc, query_date, query_time, user_specified_transfer
-            
+            # 返回解析结果
+            if from_city and to_city:
+                return ticket_type, from_city, to_city, query_date, query_time
+            else:
+                return None
+                
         except Exception as e:
-            logger.error(f"自然语言中转查询解析失败：{e}")
+            logger.error(f"自然语言中转查询解析失败: {e}")
             logger.error(traceback.format_exc())
-            return None, None, None, None, None, None
+            return None
 
     def _find_transfer_stations(self, from_loc, to_loc, user_specified=None):
         """确定中转站"""
@@ -1988,27 +1891,37 @@ class TicketQuery(Plugin):
         return "\n\n".join(result)
 
     def _process_query(self, e_context: EventContext):
-        """处理查询请求"""
-        query = e_context["query"]
-        logger.debug(f"收到查询请求：{query}")
+        """处理所有类型的查询请求"""
+        query = self.content.strip()
+        logger.info(f"处理查询: {query}")
         
-        # 解析查询参数
-        ticket_type = "高铁"  # 默认查询高铁
-        from_loc = "上海"
-        to_loc = "北京"
-        time = "12:00"  # 默认中午12点
-        
-        # 获取车票信息
-        trains = self.get_ticket_info(ticket_type, from_loc, to_loc, None, time)
-        if trains is None:
-            e_context["reply"] = "抱歉，查询失败，请稍后重试"
-            e_context.action = EventAction.BREAK_PASS
-            return
+        # 检查是否是中转查询
+        if query.startswith("中转"):
+            logger.info("检测到中转查询")
+            return self._handle_transfer_query(e_context)
             
-        # 格式化结果
-        reply = self._format_train_info(trains)
-        e_context["reply"] = reply
-        e_context.action = EventAction.BREAK_PASS
+        # 检查是否是标准格式查询（车型 出发地 目的地 日期 时间）
+        parts = query.split()
+        
+        # 优先使用LLM解析所有自然语言查询
+        if USE_OPENAI and OPENAI_API_KEY:
+            logger.info("使用LLM解析查询")
+            parsed_query = self._ai_parse_query(query)
+            if parsed_query:
+                logger.info(f"LLM解析结果: {parsed_query}")
+                self.content = parsed_query
+                parts = parsed_query.split()
+            else:
+                logger.warning("LLM解析失败，尝试使用传统方法")
+        
+        # 检查是否满足标准格式
+        if len(parts) < 3:
+            logger.info("查询格式不标准，尝试自然语言解析")
+            self._process_natural_language()
+            return self._handle_main_query(e_context)
+            
+        # 已经是标准格式或经过处理后的查询
+        return self._handle_main_query(e_context)
 
     def _convert_runtime_to_minutes(self, runtime_str):
         """将运行时长字符串转换为分钟数"""
@@ -2026,3 +1939,198 @@ class TicketQuery(Plugin):
         except Exception as e:
             logger.error(f"运行时间转换错误：{runtime_str}, {e}")
             return 0
+
+    def _ai_filter(self, question):
+        """使用OpenAI筛选普通查询结果"""
+        if not USE_OPENAI or not OPENAI_API_KEY:
+            logger.warning("OpenAI配置无效，无法使用AI筛选")
+            return None
+            
+        try:
+            # 配置OpenAI
+            logger.info(f"初始化OpenAI客户端...")
+            logger.info(f"API密钥前8位: {OPENAI_API_KEY[:8] if OPENAI_API_KEY else '未配置'}")
+            logger.info(f"API基础URL: {OPENAI_API_BASE}")
+            logger.info(f"使用模型: {OPENAI_MODEL}")
+            
+            # 强制重新配置OpenAI
+            openai.api_key = OPENAI_API_KEY
+            openai.api_base = OPENAI_API_BASE
+            
+            # 准备数据，始终使用原始数据，限制数量防止超出API限制
+            max_data_items = min(len(self.original_data), 30)
+            sample_data = self.original_data[:max_data_items]
+            
+            # 简化样本数据以适应token限制
+            simplified_samples = []
+            for train in sample_data:
+                simplified = {
+                    "trainumber": train.get("trainumber"),
+                    "traintype": train.get("traintype"),
+                    "departtime": train.get("departtime"),
+                    "arrivetime": train.get("arrivetime"),
+                    "runtime": train.get("runtime"),
+                    "departstation": train.get("departstation"),
+                    "arrivestation": train.get("arrivestation"),
+                    "ticket_info": [
+                        {
+                            "seatname": seat.get("seatname"),
+                            "seatprice": seat.get("seatprice"),
+                            "seatinventory": seat.get("seatinventory")
+                        } for seat in train.get("ticket_info", [])[:3]  # 只保留前三种座位类型
+                    ],
+                    "index": sample_data.index(train)  # 添加索引以便后续查找
+                }
+                simplified_samples.append(simplified)
+            
+            sample_json = json.dumps(simplified_samples, ensure_ascii=False)
+            logger.info(f"已准备{len(simplified_samples)}/{len(self.original_data)}条数据用于AI筛选")
+            
+            # 构建提示
+            prompt = f"""
+            请根据以下筛选条件，从给定的列车数据中找出满足条件的车次："{question}"
+            
+            具体要求：
+            1. 返回完全符合条件的车次索引列表
+            2. 如果筛选条件包含价格相关（如最便宜、最贵），应当按价格排序
+            3. 如果筛选条件包含时间相关（如最早、最晚、上午、下午），应当按出发时间筛选
+            4. 如果条件包含座位偏好（如二等座、一等座、商务座），应当筛选相应票种
+            5. 如果条件包含余票要求，应当检查对应座位的余票情况
+            
+            车次信息如下（JSON格式）：
+            {sample_json}
+            
+            请返回以下JSON格式结果（不要输出其他解释）：
+            {{
+                "matched_indices": [索引列表],
+                "explanation": "简要解释为什么选中这些车次",
+                "is_sorted": true/false,
+                "sort_criteria": "排序依据（如价格、时间等）"
+            }}
+            """
+            
+            # 调用OpenAI
+            try:
+                logger.info("开始调用OpenAI API进行筛选...")
+                result_text = ""
+                
+                try:
+                    # 标准ChatCompletion API
+                    response = openai.ChatCompletion.create(
+                        model=OPENAI_MODEL,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.3,
+                        max_tokens=1000
+                    )
+                    result_text = response.choices[0].message.content.strip()
+                    
+                except AttributeError:
+                    try:
+                        # 最新客户端格式
+                        response = openai.chat.completions.create(
+                            model=OPENAI_MODEL,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.3,
+                            max_tokens=1000
+                        )
+                        result_text = response.choices[0].message.content.strip()
+                        
+                    except Exception as latest_error:
+                        logger.warning(f"最新API调用失败: {latest_error}")
+                        
+                        try:
+                            # 旧版API
+                            response = openai.Completion.create(
+                                model=OPENAI_MODEL,
+                                prompt=prompt,
+                                temperature=0.3,
+                                max_tokens=1000
+                            )
+                            result_text = response.choices[0].text.strip()
+                        except Exception as old_error:
+                            logger.error(f"所有API调用方法均失败: {old_error}")
+                            
+                            # 使用HTTP直接请求
+                            api_url = f"{OPENAI_API_BASE.rstrip('/')}/chat/completions"
+                            headers = {
+                                "Content-Type": "application/json",
+                                "Authorization": f"Bearer {OPENAI_API_KEY}"
+                            }
+                            payload = {
+                                "model": OPENAI_MODEL,
+                                "messages": [{"role": "user", "content": prompt}],
+                                "temperature": 0.3,
+                                "max_tokens": 1000
+                            }
+                            response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+                            if response.status_code == 200:
+                                result_text = response.json()["choices"][0]["message"]["content"].strip()
+                            else:
+                                raise Exception(f"HTTP请求失败: {response.text}")
+                
+                except Exception as api_error:
+                    logger.error(f"API调用失败: {api_error}")
+                    return None
+                
+                if not result_text:
+                    logger.warning("OpenAI返回空结果")
+                    return None
+                    
+                logger.info(f"OpenAI返回结果: {result_text}")
+                
+                # 解析返回的JSON
+                try:
+                    result_json = json.loads(result_text)
+                    matched_indices = result_json.get("matched_indices", [])
+                    logger.info(f"解析到的匹配索引: {matched_indices}")
+                    
+                    # 根据索引获取原始数据
+                    filtered_data = []
+                    for idx in matched_indices:
+                        if 0 <= idx < len(sample_data):
+                            filtered_data.append(sample_data[idx])
+                    
+                    logger.info(f"筛选后的车次数量: {len(filtered_data)}")
+                    
+                    # 如果结果是排序的，确保保持排序
+                    if result_json.get("is_sorted", False):
+                        logger.info(f"结果已按{result_json.get('sort_criteria', '未知标准')}排序")
+                        return filtered_data
+                    
+                    return filtered_data
+                    
+                except json.JSONDecodeError:
+                    logger.error(f"JSON解析失败: {result_text}")
+                    
+                    # 如果JSON解析失败，尝试直接提取索引
+                    try:
+                        import re
+                        indices_match = re.search(r"matched_indices.*?(\[.*?\])", result_text, re.DOTALL)
+                        if indices_match:
+                            indices_str = indices_match.group(1)
+                            # 处理可能的格式问题
+                            indices_str = indices_str.replace("'", '"')
+                            matched_indices = json.loads(indices_str)
+                            
+                            # 根据索引获取原始数据
+                            filtered_data = []
+                            for idx in matched_indices:
+                                if 0 <= idx < len(sample_data):
+                                    filtered_data.append(sample_data[idx])
+                            
+                            logger.info(f"通过正则提取索引后，筛选出车次数量: {len(filtered_data)}")
+                            return filtered_data
+                    except Exception as regex_error:
+                        logger.error(f"正则提取失败: {regex_error}")
+                    
+                    return None
+                    
+            except Exception as e:
+                logger.error(f"调用OpenAI API失败: {e}")
+                logger.error(traceback.format_exc())
+                return None
+                
+        except Exception as general_error:
+            logger.error(f"AI筛选过程中发生错误: {general_error}")
+            logger.error(traceback.format_exc())
+            return None
