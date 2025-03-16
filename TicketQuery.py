@@ -115,8 +115,8 @@ BASE_URL_HIGHSPEEDTICKET = "https://api.pearktrue.cn/api/highspeedticket"
 
 @plugins.register(name="TicketQuery",
                   desc="智能票务查询插件",
-                  version="0.1",
-                  author="sllt",
+                  version="1.0",
+                  author="sofs2005",
                   desire_priority=100)
 class TicketQuery(Plugin):
     content = None
@@ -337,6 +337,17 @@ class TicketQuery(Plugin):
             
             logger.info(f"解析的查询参数: 车型={ticket_type}, 出发地={from_loc}, 目的地={to_loc}, 日期={date}, 时间={time}")
             
+            # 标准化车型（确保与API兼容）
+            if ticket_type.lower() in ["普通火车", "火车", "普快", "特快", "快车", "特快列车"]:
+                ticket_type = "普通"
+                logger.info(f"标准化车型: '{ticket_type}' -> '普通'")
+            elif ticket_type.lower() in ["高速", "高速铁路", "高铁列车", "高速列车"]:
+                ticket_type = "高铁"
+                logger.info(f"标准化车型: '{ticket_type}' -> '高铁'")
+            elif ticket_type.lower() in ["动车组", "动车列车"]:
+                ticket_type = "动车"
+                logger.info(f"标准化车型: '{ticket_type}' -> '动车'")
+            
             # 调用车票API获取信息
             trains = self.get_ticket_info(ticket_type, from_loc, to_loc, date, time)
             
@@ -441,6 +452,18 @@ class TicketQuery(Plugin):
         logger.info(f"开始处理API数据：车型={ticket_type}, 查询时间={query_time}")
         logger.info(f"收到{len(data)}条数据待处理")
         
+        # 标准化查询车型，确保与API返回数据兼容
+        standard_ticket_type = ticket_type
+        if ticket_type.lower() in ["普通火车", "火车", "普快", "特快", "快车", "特快列车"]:
+            standard_ticket_type = "普通"
+            logger.info(f"标准化查询车型: '{ticket_type}' -> '普通'")
+        elif ticket_type.lower() in ["高速", "高速铁路", "高铁列车", "高速列车"]:
+            standard_ticket_type = "高铁"
+            logger.info(f"标准化查询车型: '{ticket_type}' -> '高铁'")
+        elif ticket_type.lower() in ["动车组", "动车列车"]:
+            standard_ticket_type = "动车"
+            logger.info(f"标准化查询车型: '{ticket_type}' -> '动车'")
+            
         # 处理模糊时间表达
         time_window_minutes = 30  # 默认时间窗口±30分钟
         time_range_start = None
@@ -491,9 +514,9 @@ class TicketQuery(Plugin):
                 
                 logger.info(f"处理车次：{train_number} 类型：{train_type} 发车：{depart_time}")
                 
-                # 1. 车型筛选
-                if train_type != ticket_type:
-                    logger.debug(f"车次{train_number}类型不匹配，跳过")
+                # 1. 车型筛选 - 使用标准化后的车型进行匹配
+                if train_type != standard_ticket_type:
+                    logger.debug(f"车次{train_number}类型({train_type})不匹配查询的车型({standard_ticket_type})，跳过")
                     continue
                     
                 # 2. 时间筛选
@@ -1410,6 +1433,22 @@ class TicketQuery(Plugin):
                             parts[4] = "19:00"
                             logger.info(f"将模糊时间'{time_part}'转换为: 19:00")
             
+            # 标准化车型名称
+            if len(parts) > 0:
+                # 车型标准化处理
+                train_type = parts[0].lower()
+                if any(keyword in train_type for keyword in ["高铁", "g", "高速", "高速铁路"]):
+                    parts[0] = "高铁"
+                    logger.info("标准化车型: 高铁")
+                elif any(keyword in train_type for keyword in ["动车", "d", "动车组"]):
+                    parts[0] = "动车"
+                    logger.info("标准化车型: 动车")
+                elif any(keyword in train_type for keyword in ["普通", "k", "t", "普通火车", "硬座", "硬卧", "火车", "特快", "普快"]):
+                    parts[0] = "普通"
+                    logger.info("标准化车型: 普通")
+                else:
+                    logger.info(f"未识别的车型: {parts[0]}，保持原样")
+            
             # 重新组合处理后的结果
             return " ".join(parts)
                 
@@ -1526,6 +1565,22 @@ class TicketQuery(Plugin):
             date = result_json.get("date")
             time = result_json.get("time")
             transfer_station = result_json.get("transfer_station")
+            
+            # 标准化车型
+            if ticket_type:
+                # 车型标准化处理
+                train_type = ticket_type.lower()
+                if any(keyword in train_type for keyword in ["高铁", "g", "高速", "高速铁路"]):
+                    ticket_type = "高铁"
+                    logger.info("标准化中转查询车型: 高铁")
+                elif any(keyword in train_type for keyword in ["动车", "d", "动车组"]):
+                    ticket_type = "动车"
+                    logger.info("标准化中转查询车型: 动车")
+                elif any(keyword in train_type for keyword in ["普通", "k", "t", "普通火车", "硬座", "硬卧", "火车", "特快", "普快"]):
+                    ticket_type = "普通"
+                    logger.info("标准化中转查询车型: 普通")
+                else:
+                    logger.info(f"未识别的中转查询车型: {ticket_type}，保持原样")
             
             # 验证必要字段
             if ticket_type and from_loc and to_loc:
