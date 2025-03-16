@@ -270,14 +270,47 @@ class TicketQuery(Plugin):
             e_context["reply"] = reply
             e_context.action = EventAction.BREAK_PASS
             return
+        
+        # 检查是否是与火车票查询相关的请求
+        ticket_keywords = ["高铁", "动车", "火车", "列车", "票", "车次", "站", "硬座", "软卧", 
+                         "硬卧", "车票", "坐车", "出行", "旅行", "时刻表", "次日", "当日", 
+                         "始发", "终点", "到达", "出发", "二等座", "一等座", "特等座", "商务座", 
+                         "铁路", "乘坐", "乘车", "快车", "空调", "特快", "直达", "普通", "普快"]
+        
+        # 检查城市名称和出行词组
+        direction_keywords = ["从", "到", "去", "至", "往", "前往", "出发", "返回"]
+        travel_patterns = [
+            r"从(.{1,5})(到|去|至)(.{1,5})",  # 从A到B
+            r"(.{1,5})(到|去|至)(.{1,5})",     # A到B
+            r"(.{1,5})(发往|开往)(.{1,5})"     # A发往B
+        ]
+        
+        # 判断是否包含火车票关键词
+        contains_ticket_keyword = any(keyword in self.content for keyword in ticket_keywords)
+        
+        # 判断是否包含方向关键词
+        contains_direction_keyword = any(keyword in self.content for keyword in direction_keywords)
+        
+        # 判断是否匹配出行模式
+        matches_travel_pattern = any(re.search(pattern, self.content) for pattern in travel_patterns)
+        
+        # 检查是否包含中转或换乘关键词
+        is_transfer_query = self.content.startswith("中转") or "换乘" in self.content
+        
+        # 如果不满足任何条件，则不处理该请求
+        if not (contains_ticket_keyword or (contains_direction_keyword and matches_travel_pattern) or is_transfer_query):
+            logger.info(f"请求内容与火车票查询无关，不进行处理: {self.content}")
+            return
+        
+        # 接下来处理符合条件的请求
             
         # 检查是否是中转查询
-        if self.content.startswith("中转") or "换乘" in self.content:
+        if is_transfer_query:
             logger.info("检测到中转查询请求")
             self._handle_transfer_query(e_context)
             return
             
-        # 所有其他查询都视为普通查询，用LLM处理
+        # 所有其他符合条件的查询都视为普通查询，用LLM处理
         logger.info("处理普通查询请求")
         # 保存原始查询内容，便于后续处理
         self.original_query = self.content
