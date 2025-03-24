@@ -115,9 +115,9 @@ BASE_URL_HIGHSPEEDTICKET = "https://api.pearktrue.cn/api/highspeedticket"
 
 @plugins.register(name="TicketQuery",
                   desc="智能票务查询插件",
-                  version="1.0",
+                  version="1.1",
                   author="sofs2005",
-                  desire_priority=100)
+                  desire_priority=10)
 class TicketQuery(Plugin):
     content = None
     ticket_info_list = []
@@ -271,40 +271,18 @@ class TicketQuery(Plugin):
             e_context.action = EventAction.BREAK_PASS
             return
         
-        # 检查是否是与火车票查询相关的请求
-        ticket_keywords = ["高铁", "动车", "火车", "列车", "票", "车次", "站", "硬座", "软卧", 
-                         "硬卧", "车票", "坐车", "出行", "旅行", "时刻表", "次日", "当日", 
-                         "始发", "终点", "到达", "出发", "二等座", "一等座", "特等座", "商务座", 
-                         "铁路", "乘坐", "乘车", "快车", "空调", "特快", "直达", "普通", "普快"]
+        # 使用大模型判断是否是火车票查询相关的请求
+        is_ticket_query = self._ai_is_ticket_query(self.content)
         
-        # 检查城市名称和出行词组
-        direction_keywords = ["从", "到", "去", "至", "往", "前往", "出发", "返回"]
-        travel_patterns = [
-            r"从(.{1,5})(到|去|至)(.{1,5})",  # 从A到B
-            r"(.{1,5})(到|去|至)(.{1,5})",     # A到B
-            r"(.{1,5})(发往|开往)(.{1,5})"     # A发往B
-        ]
-        
-        # 判断是否包含火车票关键词
-        contains_ticket_keyword = any(keyword in self.content for keyword in ticket_keywords)
-        
-        # 判断是否包含方向关键词
-        contains_direction_keyword = any(keyword in self.content for keyword in direction_keywords)
-        
-        # 判断是否匹配出行模式
-        matches_travel_pattern = any(re.search(pattern, self.content) for pattern in travel_patterns)
-        
-        # 检查是否包含中转或换乘关键词
-        is_transfer_query = self.content.startswith("中转") or "换乘" in self.content
-        
-        # 如果不满足任何条件，则不处理该请求
-        if not (contains_ticket_keyword or (contains_direction_keyword and matches_travel_pattern) or is_transfer_query):
+        # 如果不是火车票查询相关的请求，则不处理
+        if not is_ticket_query:
             logger.info(f"请求内容与火车票查询无关，不进行处理: {self.content}")
             return
         
-        # 接下来处理符合条件的请求
-            
         # 检查是否是中转查询
+        is_transfer_query = self.content.startswith("中转") or "换乘" in self.content
+        
+        # 接下来处理符合条件的请求
         if is_transfer_query:
             logger.info("检测到中转查询请求")
             self._handle_transfer_query(e_context)
@@ -315,6 +293,159 @@ class TicketQuery(Plugin):
         # 保存原始查询内容，便于后续处理
         self.original_query = self.content
         self._process_query(e_context)
+
+    def _ai_is_ticket_query(self, query):
+        """使用OpenAI判断是否是火车票查询请求"""
+        if not USE_OPENAI or not OPENAI_API_KEY:
+            logger.warning("OpenAI配置无效，使用关键词匹配判断查询意图")
+            # 退化为关键词匹配方式
+            ticket_keywords = ["高铁", "动车", "火车", "列车", "票", "车次", "站", "硬座", "软卧", 
+                             "硬卧", "车票", "坐车", "出行", "旅行", "时刻表", "次日", "当日", 
+                             "始发", "终点", "到达", "出发", "二等座", "一等座", "特等座", "商务座", 
+                             "铁路", "乘坐", "乘车", "快车", "空调", "特快", "直达", "普通", "普快"]
+            
+            # 检查城市名称和出行词组
+            direction_keywords = ["从", "到", "去", "至", "往", "前往", "出发", "返回"]
+            travel_patterns = [
+                r"从(.{1,5})(到|去|至)(.{1,5})",  # 从A到B
+                r"(.{1,5})(到|去|至)(.{1,5})",     # A到B
+                r"(.{1,5})(发往|开往)(.{1,5})"     # A发往B
+            ]
+            
+            # 判断是否包含火车票关键词
+            contains_ticket_keyword = any(keyword in query for keyword in ticket_keywords)
+            
+            # 判断是否包含方向关键词
+            contains_direction_keyword = any(keyword in query for keyword in direction_keywords)
+            
+            # 判断是否匹配出行模式
+            matches_travel_pattern = any(re.search(pattern, query) for pattern in travel_patterns)
+            
+            return contains_ticket_keyword or (contains_direction_keyword and matches_travel_pattern)
+            
+        logger.info(f"使用OpenAI判断查询意图: {query}")
+        
+        try:
+            # 强制重新配置OpenAI
+            openai.api_key = OPENAI_API_KEY
+            openai.api_base = OPENAI_API_BASE
+            
+            # 构建提示
+            prompt = f"""
+            请判断以下用户请求是否是关于火车票或高铁票查询的问题："{query}"
+            
+            判断标准：
+            1. 请求包含关于火车、高铁、动车、列车等交通工具的关键词
+            2. 请求涉及到车票、座位、车次、站点等相关内容
+            3. 请求包含出行地点、时间等信息
+            4. 请求是关于查询车票、列车时刻表或相关信息的
+            
+            请只返回"是"或"否"，不要有其他解释。
+            """
+            
+            # 调用OpenAI API
+            result_text = ""
+            
+            try:
+                # 标准ChatCompletion API
+                response = openai.ChatCompletion.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=10
+                )
+                result_text = response.choices[0].message.content.strip()
+                
+            except AttributeError:
+                try:
+                    # 最新客户端格式
+                    response = openai.chat.completions.create(
+                        model=OPENAI_MODEL,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.1,
+                        max_tokens=10
+                    )
+                    result_text = response.choices[0].message.content.strip()
+                    
+                except Exception as latest_error:
+                    logger.warning(f"最新API调用失败: {latest_error}")
+                    
+                    try:
+                        # 旧版API
+                        response = openai.Completion.create(
+                            model=OPENAI_MODEL,
+                            prompt=prompt,
+                            temperature=0.1,
+                            max_tokens=10
+                        )
+                        result_text = response.choices[0].text.strip()
+                    except Exception as old_error:
+                        logger.error(f"所有API调用方法均失败: {old_error}")
+                        
+                        # 使用HTTP直接请求
+                        api_url = f"{OPENAI_API_BASE.rstrip('/')}/chat/completions"
+                        headers = {
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {OPENAI_API_KEY}"
+                        }
+                        payload = {
+                            "model": OPENAI_MODEL,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.1,
+                            "max_tokens": 10
+                        }
+                        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+                        if response.status_code == 200:
+                            result_text = response.json()["choices"][0]["message"]["content"].strip()
+                        else:
+                            raise Exception(f"HTTP请求失败: {response.text}")
+            
+            except Exception as api_error:
+                logger.error(f"API调用失败: {api_error}")
+                return False
+            
+            logger.info(f"OpenAI返回判断结果: {result_text}")
+            
+            # 解析返回结果
+            is_query = False
+            if "是" in result_text.lower() or "yes" in result_text.lower() or "true" in result_text.lower():
+                is_query = True
+                logger.info("OpenAI判断为车票查询请求")
+            else:
+                logger.info("OpenAI判断为非车票查询请求")
+                
+            return is_query
+                
+        except Exception as e:
+            logger.error(f"使用OpenAI判断查询意图失败: {str(e)}")
+            logger.error(traceback.format_exc())
+            
+            # 出错时退化为关键词匹配
+            logger.warning("退化为关键词匹配判断查询意图")
+            # 使用与之前相同的关键词匹配逻辑
+            ticket_keywords = ["高铁", "动车", "火车", "列车", "票", "车次", "站", "硬座", "软卧", 
+                             "硬卧", "车票", "坐车", "出行", "旅行", "时刻表", "次日", "当日", 
+                             "始发", "终点", "到达", "出发", "二等座", "一等座", "特等座", "商务座", 
+                             "铁路", "乘坐", "乘车", "快车", "空调", "特快", "直达", "普通", "普快"]
+            
+            # 检查城市名称和出行词组
+            direction_keywords = ["从", "到", "去", "至", "往", "前往", "出发", "返回"]
+            travel_patterns = [
+                r"从(.{1,5})(到|去|至)(.{1,5})",  # 从A到B
+                r"(.{1,5})(到|去|至)(.{1,5})",     # A到B
+                r"(.{1,5})(发往|开往)(.{1,5})"     # A发往B
+            ]
+            
+            # 判断是否包含火车票关键词
+            contains_ticket_keyword = any(keyword in query for keyword in ticket_keywords)
+            
+            # 判断是否包含方向关键词
+            contains_direction_keyword = any(keyword in query for keyword in direction_keywords)
+            
+            # 判断是否匹配出行模式
+            matches_travel_pattern = any(re.search(pattern, query) for pattern in travel_patterns)
+            
+            return contains_ticket_keyword or (contains_direction_keyword and matches_travel_pattern)
 
     def _process_natural_language(self):
         """处理自然语言查询，完全由LLM解析"""
