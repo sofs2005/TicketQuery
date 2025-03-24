@@ -115,7 +115,7 @@ BASE_URL_HIGHSPEEDTICKET = "https://api.pearktrue.cn/api/highspeedticket"
 
 @plugins.register(name="TicketQuery",
                   desc="智能票务查询插件",
-                  version="1.1",
+                  version="1.2",
                   author="sofs2005",
                   desire_priority=10)
 class TicketQuery(Plugin):
@@ -149,31 +149,22 @@ class TicketQuery(Plugin):
         # 重新加载OpenAI配置，确保配置正确加载
         self._load_openai_config()
         
-        logger.info(f"[{__class__.__name__}] 插件初始化完成")
-        logger.info(f"OpenAI使用状态: {'已启用' if USE_OPENAI else '未启用'}")
-        if USE_OPENAI:
-            logger.info(f"OpenAI配置信息: API密钥前8位={OPENAI_API_KEY[:8]}..., 基础URL={OPENAI_API_BASE}, 模型={OPENAI_MODEL}")
+        logger.info(f"[{__class__.__name__}] 初始化完成，OpenAI状态: {'已启用' if USE_OPENAI else '未启用'}")
 
     def _load_openai_config(self):
         """重新加载OpenAI配置"""
         global USE_OPENAI, OPENAI_API_KEY, OPENAI_API_BASE, OPENAI_MODEL, OPENAI_API_VERSION
         
-        logger.info("====== 重新加载OpenAI配置 ======")
         try:
             # 获取插件目录路径
             plugin_dir = os.path.dirname(os.path.abspath(__file__))
             config_path = os.path.join(plugin_dir, "config.json")
-            logger.info(f"尝试从 {config_path} 加载配置")
             
             if os.path.exists(config_path):
-                logger.info(f"配置文件存在，开始读取")
                 try:
                     with open(config_path, 'r', encoding='utf-8') as f:
                         file_content = f.read()
-                        logger.info(f"读取到配置文件内容: {file_content}")
                         plugin_config = json.loads(file_content)
-                    
-                    logger.info(f"配置文件解析结果: {json.dumps(plugin_config, ensure_ascii=False)}")
                     
                     # 提取OpenAI配置
                     OPENAI_API_KEY = plugin_config.get("open_ai_api_key")
@@ -184,7 +175,7 @@ class TicketQuery(Plugin):
                         
                         # 检查API基础URL是否已包含API版本
                         if OPENAI_API_BASE.endswith(f"/{OPENAI_API_VERSION}"):
-                            logger.info(f"API基础URL已包含版本信息: {OPENAI_API_BASE}")
+                            pass
                         else:
                             # 如果URL不是以/结尾，添加/
                             if not OPENAI_API_BASE.endswith("/"):
@@ -192,7 +183,6 @@ class TicketQuery(Plugin):
                             # 再添加版本号（但不重复添加）
                             if not OPENAI_API_BASE.endswith(f"{OPENAI_API_VERSION}/"):
                                 OPENAI_API_BASE += f"{OPENAI_API_VERSION}"
-                            logger.info(f"调整后的API基础URL: {OPENAI_API_BASE}")
                         
                         USE_OPENAI = True
                         
@@ -200,24 +190,20 @@ class TicketQuery(Plugin):
                         openai.api_key = OPENAI_API_KEY
                         openai.api_base = OPENAI_API_BASE
                         
-                        logger.info(f"OpenAI配置加载成功! API密钥前8位={OPENAI_API_KEY[:8]}..., 基础URL={OPENAI_API_BASE}, 模型={OPENAI_MODEL}")
-                        logger.info(f"OpenAI客户端初始化完成")
+                        logger.info(f"OpenAI配置加载成功")
                     else:
                         logger.warning("未找到有效的OpenAI API密钥")
                         USE_OPENAI = False
                 except Exception as e:
                     logger.error(f"配置文件读取失败: {e}")
-                    logger.error(traceback.format_exc())
                     USE_OPENAI = False
             else:
                 logger.warning(f"配置文件不存在: {config_path}")
                 USE_OPENAI = False
         except Exception as e:
-            logger.error(f"加载OpenAI配置时出错: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"加载OpenAI配置出错: {e}")
             USE_OPENAI = False
             
-        logger.info(f"OpenAI配置加载结果: {'成功' if USE_OPENAI else '失败'}")
         return USE_OPENAI
 
     def get_help_text(self, **kwargs):
@@ -257,7 +243,7 @@ class TicketQuery(Plugin):
 
         # 处理后续筛选问题
         if self.content.startswith("+"):
-            logger.info("开始处理后续筛选问题")
+            logger.info("处理筛选请求")
             self._handle_followup_question(e_context)
             return
             
@@ -271,60 +257,75 @@ class TicketQuery(Plugin):
             e_context.action = EventAction.BREAK_PASS
             return
         
-        # 使用大模型判断是否是火车票查询相关的请求
-        is_ticket_query = self._ai_is_ticket_query(self.content)
+        # 检查是否是中转查询，直接处理不需要判断
+        is_transfer_query = self.content.startswith("中转") or "换乘" in self.content
+        if is_transfer_query:
+            logger.info("处理中转查询请求")
+            self._handle_transfer_query(e_context)
+            return
+        
+        # 使用关键词进行初步筛选
+        is_potential_query = self._is_potential_ticket_query(self.content)
+        
+        # 只有在可能是车票查询的情况下，才使用LLM进行精确判断
+        if is_potential_query:
+            is_ticket_query = self._ai_is_ticket_query(self.content)
+        else:
+            is_ticket_query = False
         
         # 如果不是火车票查询相关的请求，则不处理
         if not is_ticket_query:
-            logger.info(f"请求内容与火车票查询无关，不进行处理: {self.content}")
             return
         
-        # 检查是否是中转查询
-        is_transfer_query = self.content.startswith("中转") or "换乘" in self.content
-        
-        # 接下来处理符合条件的请求
-        if is_transfer_query:
-            logger.info("检测到中转查询请求")
-            self._handle_transfer_query(e_context)
-            return
-            
-        # 所有其他符合条件的查询都视为普通查询，用LLM处理
-        logger.info("处理普通查询请求")
+        # 所有符合条件的查询都视为普通查询，用LLM处理
+        logger.info("处理车票查询请求")
         # 保存原始查询内容，便于后续处理
         self.original_query = self.content
         self._process_query(e_context)
 
+    def _is_potential_ticket_query(self, query):
+        """初步判断是否可能是车票查询请求（基于关键词和模式匹配）"""
+        # 票务相关关键词
+        ticket_keywords = ["高铁", "动车", "火车", "列车", "票", "车次", "站", "硬座", "软卧", 
+                         "硬卧", "车票", "坐车", "出行", "旅行", "时刻表", "次日", "当日", 
+                         "始发", "终点", "到达", "出发", "二等座", "一等座", "特等座", "商务座", 
+                         "铁路", "乘坐", "乘车", "快车", "空调", "特快", "直达", "普通", "普快"]
+        
+        # 方向相关关键词
+        direction_keywords = ["从", "到", "去", "至", "往", "前往", "出发", "返回"]
+        
+        # 出行模式正则表达式
+        travel_patterns = [
+            r"从(.{1,5})(到|去|至)(.{1,5})",  # 从A到B
+            r"(.{1,5})(到|去|至)(.{1,5})",     # A到B
+            r"(.{1,5})(发往|开往)(.{1,5})"     # A发往B
+        ]
+        
+        # 判断是否包含火车票关键词
+        contains_ticket_keyword = any(keyword in query for keyword in ticket_keywords)
+        
+        # 判断是否包含方向关键词
+        contains_direction_keyword = any(keyword in query for keyword in direction_keywords)
+        
+        # 判断是否匹配出行模式
+        matches_travel_pattern = any(re.search(pattern, query) for pattern in travel_patterns)
+        
+        # 根据条件判断
+        is_potential = contains_ticket_keyword or (contains_direction_keyword and matches_travel_pattern)
+        
+        # 只在判断为可能车票查询时记录日志，减少日志量
+        if is_potential:
+            logger.info(f"关键词筛选通过: {query}")
+            
+        return is_potential
+
     def _ai_is_ticket_query(self, query):
         """使用OpenAI判断是否是火车票查询请求"""
         if not USE_OPENAI or not OPENAI_API_KEY:
-            logger.warning("OpenAI配置无效，使用关键词匹配判断查询意图")
-            # 退化为关键词匹配方式
-            ticket_keywords = ["高铁", "动车", "火车", "列车", "票", "车次", "站", "硬座", "软卧", 
-                             "硬卧", "车票", "坐车", "出行", "旅行", "时刻表", "次日", "当日", 
-                             "始发", "终点", "到达", "出发", "二等座", "一等座", "特等座", "商务座", 
-                             "铁路", "乘坐", "乘车", "快车", "空调", "特快", "直达", "普通", "普快"]
+            logger.info("OpenAI配置无效，跳过LLM判断")
+            # 直接返回True，因为已经在_is_potential_ticket_query中通过了关键词筛选
+            return True
             
-            # 检查城市名称和出行词组
-            direction_keywords = ["从", "到", "去", "至", "往", "前往", "出发", "返回"]
-            travel_patterns = [
-                r"从(.{1,5})(到|去|至)(.{1,5})",  # 从A到B
-                r"(.{1,5})(到|去|至)(.{1,5})",     # A到B
-                r"(.{1,5})(发往|开往)(.{1,5})"     # A发往B
-            ]
-            
-            # 判断是否包含火车票关键词
-            contains_ticket_keyword = any(keyword in query for keyword in ticket_keywords)
-            
-            # 判断是否包含方向关键词
-            contains_direction_keyword = any(keyword in query for keyword in direction_keywords)
-            
-            # 判断是否匹配出行模式
-            matches_travel_pattern = any(re.search(pattern, query) for pattern in travel_patterns)
-            
-            return contains_ticket_keyword or (contains_direction_keyword and matches_travel_pattern)
-            
-        logger.info(f"使用OpenAI判断查询意图: {query}")
-        
         try:
             # 强制重新配置OpenAI
             openai.api_key = OPENAI_API_KEY
@@ -404,48 +405,20 @@ class TicketQuery(Plugin):
                 logger.error(f"API调用失败: {api_error}")
                 return False
             
-            logger.info(f"OpenAI返回判断结果: {result_text}")
-            
             # 解析返回结果
             is_query = False
             if "是" in result_text.lower() or "yes" in result_text.lower() or "true" in result_text.lower():
                 is_query = True
-                logger.info("OpenAI判断为车票查询请求")
+                logger.info(f"LLM判断结果: 是车票查询")
             else:
-                logger.info("OpenAI判断为非车票查询请求")
+                logger.info(f"LLM判断结果: 非车票查询")
                 
             return is_query
                 
         except Exception as e:
             logger.error(f"使用OpenAI判断查询意图失败: {str(e)}")
-            logger.error(traceback.format_exc())
-            
-            # 出错时退化为关键词匹配
-            logger.warning("退化为关键词匹配判断查询意图")
-            # 使用与之前相同的关键词匹配逻辑
-            ticket_keywords = ["高铁", "动车", "火车", "列车", "票", "车次", "站", "硬座", "软卧", 
-                             "硬卧", "车票", "坐车", "出行", "旅行", "时刻表", "次日", "当日", 
-                             "始发", "终点", "到达", "出发", "二等座", "一等座", "特等座", "商务座", 
-                             "铁路", "乘坐", "乘车", "快车", "空调", "特快", "直达", "普通", "普快"]
-            
-            # 检查城市名称和出行词组
-            direction_keywords = ["从", "到", "去", "至", "往", "前往", "出发", "返回"]
-            travel_patterns = [
-                r"从(.{1,5})(到|去|至)(.{1,5})",  # 从A到B
-                r"(.{1,5})(到|去|至)(.{1,5})",     # A到B
-                r"(.{1,5})(发往|开往)(.{1,5})"     # A发往B
-            ]
-            
-            # 判断是否包含火车票关键词
-            contains_ticket_keyword = any(keyword in query for keyword in ticket_keywords)
-            
-            # 判断是否包含方向关键词
-            contains_direction_keyword = any(keyword in query for keyword in direction_keywords)
-            
-            # 判断是否匹配出行模式
-            matches_travel_pattern = any(re.search(pattern, query) for pattern in travel_patterns)
-            
-            return contains_ticket_keyword or (contains_direction_keyword and matches_travel_pattern)
+            # 出错时，因为已经通过了关键词筛选，所以默认返回True
+            return True
 
     def _process_natural_language(self):
         """处理自然语言查询，完全由LLM解析"""
@@ -613,20 +586,17 @@ class TicketQuery(Plugin):
 
     def _process_api_data(self, data, ticket_type, query_time):
         """处理API返回数据"""
-        logger.info(f"开始处理API数据：车型={ticket_type}, 查询时间={query_time}")
+        logger.info(f"处理API数据：车型={ticket_type}, 查询时间={query_time}")
         logger.info(f"收到{len(data)}条数据待处理")
         
         # 标准化查询车型，确保与API返回数据兼容
         standard_ticket_type = ticket_type
         if ticket_type.lower() in ["普通火车", "火车", "普快", "特快", "快车", "特快列车"]:
             standard_ticket_type = "普通"
-            logger.info(f"标准化查询车型: '{ticket_type}' -> '普通'")
         elif ticket_type.lower() in ["高速", "高速铁路", "高铁列车", "高速列车"]:
             standard_ticket_type = "高铁"
-            logger.info(f"标准化查询车型: '{ticket_type}' -> '高铁'")
         elif ticket_type.lower() in ["动车组", "动车列车"]:
             standard_ticket_type = "动车"
-            logger.info(f"标准化查询车型: '{ticket_type}' -> '动车'")
             
         # 处理模糊时间表达
         time_window_minutes = 30  # 默认时间窗口±30分钟
@@ -635,23 +605,18 @@ class TicketQuery(Plugin):
         
         # 处理自然语言时间表达
         if query_time in ["上午", "早上", "早晨", "凌晨"]:
-            logger.info(f"检测到自然语言时间表达：{query_time}，转换为时间范围")
             time_range_start = "06:00"  # 早上6点
             time_range_end = "12:00"    # 中午12点
         elif query_time in ["中午"]:
-            logger.info(f"检测到自然语言时间表达：{query_time}，转换为时间范围")
             time_range_start = "11:00"  # 上午11点
             time_range_end = "13:00"    # 下午1点
         elif query_time in ["下午"]:
-            logger.info(f"检测到自然语言时间表达：{query_time}，转换为时间范围")
             time_range_start = "12:00"  # 中午12点
             time_range_end = "18:00"    # 下午6点
         elif query_time in ["傍晚"]:
-            logger.info(f"检测到自然语言时间表达：{query_time}，转换为时间范围")
             time_range_start = "17:00"  # 下午5点
             time_range_end = "19:00"    # 晚上7点
         elif query_time in ["晚上", "夜晚", "夜里"]:
-            logger.info(f"检测到自然语言时间表达：{query_time}，转换为时间范围")
             time_range_start = "18:00"  # 下午6点
             time_range_end = "23:59"    # 午夜
             
@@ -665,22 +630,17 @@ class TicketQuery(Plugin):
             logger.info(f"启用近似时间过滤：{self.approximate_time}±{time_window_minutes}分钟")
         elif query_time:
             logger.info(f"启用精确时间过滤：{query_time}之后的车次")
-        else:
-            logger.info("未指定时间过滤条件，将返回全天车次")
         
         filtered = []
         for item in data:
             try:
-                # 记录每条数据的处理
+                # 简化日志记录，只记录必要信息
                 train_number = item.get('trainumber', 'unknown')
                 train_type = item.get('traintype', 'unknown')
                 depart_time = item.get('departtime', 'unknown')
                 
-                logger.info(f"处理车次：{train_number} 类型：{train_type} 发车：{depart_time}")
-                
                 # 1. 车型筛选 - 使用标准化后的车型进行匹配
                 if train_type != standard_ticket_type:
-                    logger.debug(f"车次{train_number}类型({train_type})不匹配查询的车型({standard_ticket_type})，跳过")
                     continue
                     
                 # 2. 时间筛选
@@ -699,10 +659,7 @@ class TicketQuery(Plugin):
                         
                         # 检查发车时间是否在范围内
                         if not (start_minutes <= depart_minutes <= end_minutes):
-                            logger.info(f"车次{train_number}发车时间{depart_time}不在指定范围{time_range_start}-{time_range_end}内，跳过")
                             continue
-                        else:
-                            logger.info(f"✓ 车次{train_number}发车时间{depart_time}在指定范围{time_range_start}-{time_range_end}内")
                             
                     # 处理近似时间筛选（如"10:30左右"）
                     elif self.is_approximate_time and self.approximate_time:
@@ -716,13 +673,10 @@ class TicketQuery(Plugin):
                             
                             # 使用指定的时间窗口
                             if time_diff > time_window_minutes:
-                                logger.info(f"车次{train_number}发车时间{depart_time}与近似时间{self.approximate_time}相差{time_diff}分钟，超出{time_window_minutes}分钟窗口，跳过")
                                 continue
-                            else:
-                                logger.info(f"✓ 车次{train_number}发车时间{depart_time}在近似时间{self.approximate_time}的{time_window_minutes}分钟窗口内")
                         except ValueError as e:
-                            logger.warning(f"近似时间格式解析错误: {e}")
                             # 格式错误时，不进行筛选，允许通过
+                            pass
                     
                     # 常规时间筛选（如"14:00"）
                     elif query_time and ":" in query_time:
@@ -734,20 +688,16 @@ class TicketQuery(Plugin):
                             time_diff = depart_minutes - query_minutes
                             
                             if time_diff < -30:  # 发车时间早于查询时间30分钟以上
-                                logger.info(f"车次{train_number}发车时间{depart_time}早于查询时间{query_time}超过30分钟，跳过")
                                 continue
-                            else:
-                                logger.info(f"✓ 车次{train_number}发车时间{depart_time}接近或晚于查询时间{query_time}")
                         except ValueError as e:
-                            logger.warning(f"时间格式解析错误: {e}")
                             # 格式错误时，不进行筛选，允许通过
+                            pass
                 except ValueError as e:
-                    logger.warning(f"发车时间格式解析错误: {e}")
                     # 格式错误时，不进行筛选，允许通过
+                    pass
                         
                 # 3. 添加有效数据
                 filtered.append(item)
-                logger.info(f"✅ 添加符合条件的车次：{train_number}, 发车时间：{depart_time}, 到达时间：{item.get('arrivetime', 'unknown')}")
                           
             except KeyError as ke:
                 logger.warning(f"数据格式错误，缺少必要字段：{ke}")
@@ -760,12 +710,8 @@ class TicketQuery(Plugin):
         filtered.sort(key=lambda x: x['departtime'])
         logger.info(f"筛选完成，共有{len(filtered)}条符合条件的车次")
         
-        # 输出筛选后的第一条数据作为样例
-        if filtered:
-            logger.info(f"筛选后数据样例：{filtered[0]}")
-        
         return filtered
-        
+
     def _handle_pagination(self, e_context):
         """处理分页请求"""
         if not self.total_data:
@@ -1319,20 +1265,14 @@ class TicketQuery(Plugin):
     def _ai_parse_query(self, query):
         """使用OpenAI解析自然语言查询"""
         if not USE_OPENAI or not OPENAI_API_KEY:
-            logger.warning("OpenAI配置无效，无法使用AI解析")
             return None
             
-        logger.info(f"开始使用OpenAI解析查询: {query}")
+        logger.info(f"使用LLM解析查询: {query}")
         
         try:
             # 强制重新配置OpenAI
             openai.api_key = OPENAI_API_KEY
             openai.api_base = OPENAI_API_BASE
-            
-            # 验证OpenAI配置
-            logger.info(f"OpenAI配置验证 - API密钥前8位: {OPENAI_API_KEY[:8]}...")
-            logger.info(f"OpenAI配置验证 - API基础URL: {OPENAI_API_BASE}")
-            logger.info(f"OpenAI配置验证 - 模型: {OPENAI_MODEL}")
             
             # 获取当前日期信息，供提示中使用
             now = datetime.now()
@@ -1406,9 +1346,6 @@ class TicketQuery(Plugin):
             解析结果：高铁 武汉 长沙 {next_week_dates[2]} 10:00
             """
             
-            # 输出请求信息
-            logger.info(f"OpenAI请求：模型={OPENAI_MODEL}, prompt长度={len(prompt)}")
-            
             # 尝试多种方式调用OpenAI API
             result_text = ""
             
@@ -1417,57 +1354,44 @@ class TicketQuery(Plugin):
             
             try:
                 # 第一种方式：标准ChatCompletion API
-                logger.info("尝试使用标准ChatCompletion API")
                 response = openai.ChatCompletion.create(
                     model=OPENAI_MODEL,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.3,
                     max_tokens=50
                 )
-                logger.info("API调用成功!")
                 result_text = response.choices[0].message.content.strip()
                 
             except AttributeError as attr_error:
-                logger.warning(f"标准API不可用: {attr_error}")
-                
                 try:
                     # 第二种方式：最新客户端格式
-                    logger.info("尝试使用最新客户端格式")
                     response = openai.chat.completions.create(
                         model=OPENAI_MODEL,
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.3,
                         max_tokens=50
                     )
-                    logger.info("最新客户端API调用成功!")
                     result_text = response.choices[0].message.content.strip()
                     
                 except Exception as latest_error:
-                    logger.warning(f"最新客户端API调用失败: {latest_error}")
-                    
                     try:
                         # 第三种方式：旧版Completion API
-                        logger.info("尝试使用旧版Completion API")
                         response = openai.Completion.create(
                             model=OPENAI_MODEL,
                             prompt=prompt,
                             temperature=0.3,
                             max_tokens=50
                         )
-                        logger.info("旧版API调用成功!")
                         result_text = response.choices[0].text.strip()
                     except Exception as old_api_error:
-                        logger.error(f"所有标准API调用方式均失败: {old_api_error}")
                         all_standard_methods_failed = True
             
             except Exception as api_error:
                 logger.error(f"API调用失败: {api_error}")
-                logger.error(traceback.format_exc())
                 all_standard_methods_failed = True
                 
             # 如果所有标准方法都失败，尝试直接使用requests
             if all_standard_methods_failed:
-                logger.info("尝试使用直接HTTP请求调用OpenAI API")
                 try:
                     # 构建请求URL - 确保URL格式正确
                     api_base = OPENAI_API_BASE
@@ -1480,8 +1404,6 @@ class TicketQuery(Plugin):
                         api_url = f"{api_base}/chat/completions"
                     else:
                         api_url = f"{api_base}/chat/completions"
-                    
-                    logger.info(f"请求URL: {api_url}")
                     
                     # 构建请求头
                     headers = {
@@ -1497,36 +1419,26 @@ class TicketQuery(Plugin):
                         "max_tokens": 50
                     }
                     
-                    logger.info(f"发送HTTP请求到OpenAI API - 详细请求数据: {json.dumps(payload, ensure_ascii=False)}")
                     response = requests.post(api_url, headers=headers, json=payload, timeout=30)
                     
                     # 检查响应状态
-                    logger.info(f"API响应状态码: {response.status_code}")
                     if response.status_code == 200:
                         response_json = response.json()
-                        logger.info(f"API响应内容: {json.dumps(response_json, ensure_ascii=False)}")
                         result_text = response_json["choices"][0]["message"]["content"].strip()
-                        logger.info(f"HTTP请求成功获取到结果: {result_text}")
                     else:
                         logger.error(f"HTTP请求失败: {response.text}")
                 except Exception as req_error:
                     logger.error(f"HTTP请求出错: {req_error}")
-                    logger.error(traceback.format_exc())
             
             if not result_text:
-                logger.warning("OpenAI返回空结果")
                 return None
                 
-            logger.info(f"OpenAI返回: {result_text}")
-            
             # 解析结果
             parts = result_text.split()
             if len(parts) < 3:
-                logger.warning(f"OpenAI返回格式不正确: {result_text}")
                 return None
             
             # 确保至少包含车型、出发城市和目的城市
-            logger.info(f"解析结果: 车型={parts[0]}, 出发城市={parts[1]}, 目的城市={parts[2]}")
             
             # 标准化日期
             if len(parts) >= 4:
@@ -1570,7 +1482,6 @@ class TicketQuery(Plugin):
                         parts[3] = this_week_dates[6]
                     else:
                         parts[3] = today_date  # 默认使用今天
-                    logger.info(f"修正日期为: {parts[3]}")
             
             # 标准化时间
             if len(parts) >= 5:
@@ -1579,23 +1490,18 @@ class TicketQuery(Plugin):
                 if not re.match(r"\d{1,2}:\d{2}", time_part):
                     # 处理自然语言时间表达
                     if time_part in ["上午", "下午", "晚上", "早上", "中午", "傍晚", "凌晨", "夜晚", "夜里"]:
-                        logger.info(f"保留自然语言时间表达: {time_part}")
                         # 不做转换，保留原始表达，让_process_api_data方法处理
                         pass
                     else:
                         # 尝试将模糊时间转换为特定时间点
                         if "早" in time_part or "上午" in time_part:
                             parts[4] = "09:00"
-                            logger.info(f"将模糊时间'{time_part}'转换为: 09:00")
                         elif "中午" in time_part:
                             parts[4] = "12:00"
-                            logger.info(f"将模糊时间'{time_part}'转换为: 12:00")
                         elif "下午" in time_part:
                             parts[4] = "14:00"
-                            logger.info(f"将模糊时间'{time_part}'转换为: 14:00")
                         elif "晚" in time_part or "夜" in time_part:
                             parts[4] = "19:00"
-                            logger.info(f"将模糊时间'{time_part}'转换为: 19:00")
             
             # 标准化车型名称
             if len(parts) > 0:
@@ -1603,22 +1509,16 @@ class TicketQuery(Plugin):
                 train_type = parts[0].lower()
                 if any(keyword in train_type for keyword in ["高铁", "g", "高速", "高速铁路"]):
                     parts[0] = "高铁"
-                    logger.info("标准化车型: 高铁")
                 elif any(keyword in train_type for keyword in ["动车", "d", "动车组"]):
                     parts[0] = "动车"
-                    logger.info("标准化车型: 动车")
                 elif any(keyword in train_type for keyword in ["普通", "k", "t", "普通火车", "硬座", "硬卧", "火车", "特快", "普快"]):
                     parts[0] = "普通"
-                    logger.info("标准化车型: 普通")
-                else:
-                    logger.info(f"未识别的车型: {parts[0]}，保持原样")
             
             # 重新组合处理后的结果
             return " ".join(parts)
                 
         except Exception as e:
             logger.error(f"OpenAI解析失败: {str(e)}")
-            logger.error(traceback.format_exc())
             return None
 
     def _ai_parse_transfer_query(self, query):
@@ -2112,11 +2012,9 @@ class TicketQuery(Plugin):
     def _process_query(self, e_context: EventContext):
         """处理所有类型的查询请求"""
         query = self.content.strip()
-        logger.info(f"处理查询: {query}")
         
         # 检查是否是中转查询
         if query.startswith("中转"):
-            logger.info("检测到中转查询")
             return self._handle_transfer_query(e_context)
             
         # 检查是否是标准格式查询（车型 出发地 目的地 日期 时间）
@@ -2124,18 +2022,14 @@ class TicketQuery(Plugin):
         
         # 优先使用LLM解析所有自然语言查询
         if USE_OPENAI and OPENAI_API_KEY:
-            logger.info("使用LLM解析查询")
             parsed_query = self._ai_parse_query(query)
             if parsed_query:
-                logger.info(f"LLM解析结果: {parsed_query}")
+                logger.info(f"解析结果: {parsed_query}")
                 self.content = parsed_query
                 parts = parsed_query.split()
-            else:
-                logger.warning("LLM解析失败，尝试使用传统方法")
         
         # 检查是否满足标准格式
         if len(parts) < 3:
-            logger.info("查询格式不标准，尝试自然语言解析")
             self._process_natural_language()
             return self._handle_main_query(e_context)
             
